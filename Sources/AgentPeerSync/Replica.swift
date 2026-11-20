@@ -21,8 +21,12 @@ public enum ReplicaError: Error, Hashable, Sendable {
 /// `Replica(actor:transport:restoring:)`. The library does no I/O itself.
 ///
 /// It must be saved *before* the edit it covers can reach the network: a replica that
-/// restarts from an older state would reuse idempotency keys for different edits, which
-/// the server refuses as `.idempotencyConflict` rather than applying the wrong thing.
+/// restarts from an older state may hand out an idempotency key the server has already
+/// seen. A restored replica pulls before its first push and re-keys anything queued since
+/// the restore past every key the log holds, so those edits aren't lost. What it can't see
+/// is a key whose only outcome was a refusal (refusals never enter the log): an edit that
+/// reuses one is refused as `.idempotencyConflict`, or deduplicated into the old refusal
+/// if its body happens to be identical, and is lost.
 public struct ReplicaState: Hashable, Sendable, Codable {
     public let actor: ActorID
     public let confirmed: Snapshot
@@ -53,8 +57,9 @@ public struct SyncReport: Hashable, Sendable {
     /// The server reported a sequence gap at the head of the outbox. The outbox is kept;
     /// this means client and server disagree about history and needs an operator.
     public var stalled = false
-    /// A pulled page didn't continue from the cursor (a gap in history). Nothing past the
-    /// gap was applied and the cursor stayed where it was; a server that keeps doing this is
+    /// The pull stopped short of the server's head: a page didn't continue from the cursor
+    /// (a gap in history; nothing past it was applied), a page made no progress while the
+    /// server reported more, or the page budget ran out. A server that keeps doing this is
     /// broken, and the host should surface it rather than keep calling `sync()` silently.
     public var pullStalled = false
     public init() {}
@@ -97,6 +102,14 @@ public actor Replica {
     private var committedAhead: [CommittedEdit] = []
     private var rejections: [RejectedEdit] = []
     private var inFlight: Task<SyncReport, any Error>?
+    /// Set by `init(restoring:)`: the first sync pulls before it pushes, so keys the log
+    /// already holds are skipped before anything queued since the save goes out.
+    private var pullBeforeFirstPush = false
+    /// Keys that came from the saved outbox. They may already be on the server (a lost
+    /// response), so they are never re-keyed.
+    private var restoredKeys: Set<MutationID> = []
+    /// How many `sync()` calls joined a sync that was already running. Observed by tests.
+    private(set) var joinedSyncs = 0
 
     /// Batch and page sizes are clamped to `1...500`.
     public init(actor: ActorID, transport: any SyncTransport, pushBatchSize: Int = 50, pullPageSize: Int = 200) {
@@ -123,6 +136,8 @@ public actor Replica {
         nextSeq = state.nextSeq
         outbox = state.outbox
         committedAhead = state.committedAhead
+        pullBeforeFirstPush = true
+        restoredKeys = Set(state.outbox.map(\.id))
         // Same rule as `bumpSequencePastAdmittedEdits()`, inlined: init is nonisolated.
         let admitted = state.confirmed.appliedThrough[actor] ?? 0
         if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }
@@ -161,7 +176,21 @@ public actor Replica {
     /// Push, then pull to the server's head. Concurrent callers share one sync: a second call
     /// while one is running awaits the same work instead of pushing the same outbox twice.
     @discardableResult
+    ///
+    /// A caller that joins a running sync and still has an edit of its own in the outbox when
+    /// that sync ends (it was written after the running push had passed) gets one more sync,
+    /// so `write(...); try await sync()` always attempts to send that write.
     public func sync() async throws -> SyncReport {
+        guard let running = inFlight else { return try await startOrJoin() }
+        joinedSyncs += 1
+        let newestAtCall = nextSeq - 1 // nextSeq >= 1, so no underflow
+        let report = try await running.value
+        guard outbox.contains(where: { $0.id.clientSeq <= newestAtCall }) else { return report }
+        return try await startOrJoin()
+    }
+
+    /// Starts a sync, or joins one that is running. No follow-up round, so it can't loop.
+    private func startOrJoin() async throws -> SyncReport {
         if let running = inFlight { return try await running.value }
         let task = Task { try await self.performSync() }
         inFlight = task
@@ -178,6 +207,12 @@ public actor Replica {
         // A failed push doesn't stop the pull: with writes refused but reads working (a
         // partial outage), the replica still rebases its pending edits onto fresh state.
         // The push error is still thrown, after the pull, so the caller knows to retry.
+        if pullBeforeFirstPush {
+            try await pullToHead(into: &report) // throws before anything is pushed
+            pullBeforeFirstPush = false
+            rekeyEditsQueuedSinceRestore()
+            restoredKeys = []
+        }
         var pushFailure: (any Error)?
         do {
             try await pushOutbox(into: &report)
@@ -254,10 +289,35 @@ public actor Replica {
                 report.pulledEntries += applied
                 dropPulledCommits()
                 if report.pullStalled { return }
-                // Stop at the head, or if the page made no progress.
-                if confirmed.version >= head || confirmed.version == cursor { return }
+                if confirmed.version >= head { return }
+                // A page that made no progress while the server says there is more: report
+                // it rather than claim to be caught up.
+                if confirmed.version == cursor {
+                    report.pullStalled = true
+                    return
+                }
             }
         }
+        report.pullStalled = true // page budget exhausted before reaching the head
+    }
+
+    /// Edits queued after `init(restoring:)` have never been sent (the first sync pulls
+    /// first). If any of their keys is one the log already holds, give all of them, in
+    /// order, fresh keys after both the log's and the saved outbox's highest key.
+    private func rekeyEditsQueuedSinceRestore() {
+        let admitted = confirmed.appliedThrough[actor] ?? 0
+        let fresh = outbox.indices.filter { !restoredKeys.contains(outbox[$0].id) }
+        guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }
+        let highestRestored = restoredKeys.map(\.clientSeq).max() ?? 0
+        let start = max(admitted, highestRestored)
+        // Bounded by the outbox cap, far from UInt64.max; checked anyway.
+        guard start < UInt64.max - UInt64(fresh.count) else { return }
+        var next = start + 1
+        for index in fresh where outbox.indices.contains(index) {
+            outbox[index] = Mutation(id: MutationID(actor: actor, clientSeq: next), body: outbox[index].body)
+            next += 1
+        }
+        nextSeq = max(nextSeq, next)
     }
 
     private func dropPulledCommits() {

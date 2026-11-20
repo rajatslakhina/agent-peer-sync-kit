@@ -137,9 +137,11 @@ final class CommitLogTests: XCTestCase {
         XCTAssertEqual(Fingerprint(mutation).hex, "8a32692bb50326605782e31149c66b1b")
         let other = write(Names.asha, 1, Names.item1, [.add(Names.votes, 2)])
         XCTAssertNotEqual(Fingerprint(mutation), Fingerprint(other))
-        // A huge body still costs 16 bytes in the window.
-        let huge = write(Names.asha, 1, Names.item1, [.set(Names.notes, .text(String(repeating: "x", count: 1_000_000)))])
-        XCTAssertEqual(MemoryLayout.size(ofValue: Fingerprint(huge)), 16)
+        // What the window keeps per outcome is the 16-byte fingerprint plus the outcome,
+        // nothing that holds the caller-sized body.
+        XCTAssertEqual(MemoryLayout<Fingerprint>.size, 16)
+        XCTAssertEqual(CommitLog.storedOutcomeSize,
+                       MemoryLayout<Fingerprint>.size + MemoryLayout<MutationOutcome>.size)
     }
 
     // MARK: Review

@@ -19,8 +19,7 @@ public enum Names {
 
     /// Provably non-nil: every literal above is 1–64 characters of `a–z 0–9 -`, which
     /// `IdentifierRule` accepts, and `AdmissionTests.testSampleNamesAreValidLiterals`
-    /// constructs each one. The precondition
-    /// documents that instead of hiding it behind a `!`.
+    /// constructs each one. The precondition documents that instead of hiding it behind a `!`.
     static func literal<T>(_ value: T?, _ text: String) -> T {
         guard let value else { preconditionFailure("\(text) is not a valid identifier literal") }
         return value

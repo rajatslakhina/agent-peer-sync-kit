@@ -8,6 +8,19 @@ private actor ControllableTransport: SyncTransport {
     let identity: ActorID
     var failPulls = false
     var failPushes = false
+    var gatePulls = false
+    private var pullWaiting: [CheckedContinuation<Void, Never>] = []
+    var parkedPulls: Int { pullWaiting.count }
+    func setGatePulls(_ value: Bool) {
+        gatePulls = value
+        if !value {
+            let resumed = pullWaiting
+            pullWaiting.removeAll()
+            for continuation in resumed { continuation.resume() }
+        }
+    }
+    var emptyPagesEnabled = false
+    func setEmptyPages(_ value: Bool) { emptyPagesEnabled = value }
     private(set) var pushCount = 0
     private var gated = false
     private var waiting: [CheckedContinuation<Void, Never>] = []
@@ -37,6 +50,8 @@ private actor ControllableTransport: SyncTransport {
 
     func pull(after cursor: UInt64, limit: Int) async throws -> PullResponse {
         if failPulls { throw TransportFailure("pull failed") }
+        if gatePulls { await withCheckedContinuation { pullWaiting.append($0) } }
+        if emptyPagesEnabled { return .entries([], head: await server.head) }
         return await server.pull(after: cursor, limit: limit)
     }
 }
@@ -200,7 +215,14 @@ final class ReplicaTests: XCTestCase {
         let parked = await link.parkedPushes
         XCTAssertEqual(parked, 1)
         let second = Task { try await replica.sync() }
-        for _ in 0..<100 { await Task.yield() }
+        // Deterministic: wait until the second call has actually joined the running sync.
+        spins = 0
+        while await replica.joinedSyncs == 0, spins < 10_000 {
+            await Task.yield()
+            spins += 1
+        }
+        let joined = await replica.joinedSyncs
+        XCTAssertEqual(joined, 1)
         await link.openGate()
         let a = try await first.value
         let b = try await second.value
@@ -219,6 +241,48 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(report.rejected, 0)
         let votes = await server.snapshot().records[Names.item1]?[Names.votes]
         XCTAssertEqual(votes, .count(5))
+    }
+
+    func testAJoinerWhoseEditMissedTheRunningPushGetsAnotherRound() async throws {
+        let server = makeServer()
+        let link = ControllableTransport(server: server, identity: Names.asha)
+        let replica = Replica(actor: Names.asha, transport: link)
+        try await replica.write(Names.item1, [.add(Names.votes, 1)])
+        await link.setGatePulls(true)
+        let first = Task { try await replica.sync() }
+        var spins = 0
+        while await link.parkedPulls == 0, spins < 10_000 {
+            await Task.yield()
+            spins += 1
+        }
+        // The running sync has pushed and is now pulling. A new edit, then a joining sync.
+        try await replica.write(Names.item1, [.add(Names.votes, 10)])
+        let second = Task { try await replica.sync() }
+        spins = 0
+        while await replica.joinedSyncs == 0, spins < 10_000 {
+            await Task.yield()
+            spins += 1
+        }
+        await link.setGatePulls(false)
+        _ = try await first.value
+        let report = try await second.value
+        XCTAssertEqual(report.committed, 1, "the joiner's own edit went out in a follow-up round")
+        let votes = await server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(11))
+    }
+
+    func testAPageThatMakesNoProgressIsReportedAsStalled() async throws {
+        let server = makeServer()
+        let writer = Replica(actor: Names.asha, transport: LocalTransport(server: server, authenticatedAs: Names.asha))
+        try await writer.write(Names.item1, [.add(Names.votes, 1)])
+        try await writer.sync()
+        let link = ControllableTransport(server: server, identity: Names.ben)
+        await link.setEmptyPages(true)
+        let reader = Replica(actor: Names.ben, transport: link)
+        let report = try await reader.sync()
+        XCTAssertTrue(report.pullStalled, "head is 1 but the page was empty")
+        let cursor = await reader.cursor
+        XCTAssertEqual(cursor, 0)
     }
 
     func testASyncAfterAFinishedSyncStartsFresh() async throws {

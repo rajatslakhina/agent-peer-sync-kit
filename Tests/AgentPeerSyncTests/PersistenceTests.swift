@@ -2,14 +2,14 @@
 import AgentPeerSyncTesting
 import XCTest
 
-/// A server stand-in that drops one entry from every page, leaving a gap.
+/// A server stand-in that drops the second entry of every page, leaving a gap after the first.
 private struct GappyTransport: SyncTransport {
     let server: CommitLog
     func push(_ batch: [Mutation]) async throws -> [PushResult] { [] }
     func pull(after cursor: UInt64, limit: Int) async throws -> PullResponse {
         let response = await server.pull(after: cursor, limit: limit)
-        guard case let .entries(page, head) = response, page.count >= 2 else { return response }
-        return .entries(Array(page.dropFirst()), head: head)
+        guard case let .entries(page, head) = response, page.count >= 3 else { return response }
+        return .entries([page[0]] + page.dropFirst(2), head: head)
     }
 }
 
@@ -56,7 +56,7 @@ final class PersistenceTests: XCTestCase {
         XCTAssertNotNil(Replica(actor: Names.ben, transport: ws.benLink, restoring: state))
     }
 
-    func testRestartingFromAStaleSaveIsRefusedByTheServerNotMisapplied() async throws {
+    func testEditQueuedAfterRestoringAStaleSaveIsReKeyedNotLost() async throws {
         let ws = Workspace()
         let stale = await ws.ben.persistentState() // saved before the edit below: the mistake
         try await ws.ben.write(Names.item1, [.set(Names.notes, .text("first"))])
@@ -64,12 +64,38 @@ final class PersistenceTests: XCTestCase {
         guard let restarted = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else {
             return XCTFail("restore")
         }
-        try await restarted.write(Names.item1, [.set(Names.notes, .text("second"))])
+        // Queued before the first sync, with the key ben#1 that the log already holds.
+        let queued = try await restarted.write(Names.item1, [.set(Names.notes, .text("second"))])
+        XCTAssertEqual(queued.clientSeq, 1)
         try await restarted.sync()
-        let rejections = await restarted.view().rejections.map(\.reason)
-        XCTAssertEqual(rejections, [.idempotencyConflict])
+        let rejections = await restarted.view().rejections
+        XCTAssertTrue(rejections.isEmpty, "re-keyed, so not refused as an idempotency conflict")
         let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(notes, .text("first"))
+        XCTAssertEqual(notes, .text("second"))
+    }
+
+    func testRestoredOutboxKeepsItsKeysWhileNewEditsAreReKeyed() async throws {
+        let ws = Workspace()
+        try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])
+        try await ws.asha.sync()
+        // Ben's vote is admitted but the answer is lost; that state is saved.
+        try await ws.ben.sync()
+        try await ws.ben.write(Names.item1, [.add(Names.votes, 1)])
+        await ws.benLink.injectOnNextPush(.dropResponse)
+        await ws.benLink.setOnline(false)
+        _ = try? await ws.ben.sync() // offline: nothing sent yet
+        let saved = await ws.ben.persistentState()
+        await ws.benLink.setOnline(true)
+        _ = try? await ws.ben.sync() // admitted, response lost
+        guard let restarted = Replica(actor: Names.ben, transport: ws.benLink, restoring: saved) else {
+            return XCTFail("restore")
+        }
+        try await restarted.write(Names.item1, [.add(Names.votes, 1)]) // ben#2, not yet in the log
+        try await restarted.sync()
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(2), "ben#1 replayed once, ben#2 applied once")
+        let rejections = await restarted.view().rejections
+        XCTAssertTrue(rejections.isEmpty)
     }
 
     func testAPullMovesTheNextKeyPastEditsTheLogAlreadyHolds() async throws {
@@ -123,9 +149,9 @@ final class PersistenceTests: XCTestCase {
         try await ws.asha.sync()
         let observer = Replica(actor: Names.ben, transport: GappyTransport(server: ws.server))
         let report = try await observer.sync()
-        XCTAssertEqual(report.pulledEntries, 0)
+        XCTAssertEqual(report.pulledEntries, 1, "the entry before the gap is applied")
         XCTAssertTrue(report.pullStalled, "the host is told the pull couldn't continue")
         let cursor = await observer.cursor
-        XCTAssertEqual(cursor, 0, "the gapped page was not applied")
+        XCTAssertEqual(cursor, 1, "nothing past the gap was applied")
     }
 }

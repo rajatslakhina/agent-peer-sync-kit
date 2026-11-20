@@ -39,10 +39,12 @@ public actor CommitLog {
 
     /// What the replay window keeps per admitted sequence number: a fixed-size fingerprint
     /// of the body (never the body itself, whose size the caller controls) and the outcome.
-    private struct StoredOutcome {
+    struct StoredOutcome {
         let fingerprint: Fingerprint
         let outcome: MutationOutcome
     }
+    /// Bytes the replay window keeps per outcome, measured where the type is compiled.
+    static let storedOutcomeSize = MemoryLayout<StoredOutcome>.size
 
     private let schema: Schema
     private let configuration: Configuration

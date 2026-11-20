@@ -27,7 +27,7 @@ MUTANTS=(
   '$S/Replica.swift|        committedAhead.removeAll { $0.seq <= confirmed.version }|        committedAhead.removeAll { _ in false }|pulled commits leave the overlay so newer remote values show'
   '$S/Replica.swift|        let unanswered = outbox.filter { $0.id.clientSeq > admitted }|        let unanswered = outbox|an edit whose response was lost is not counted twice'
   '$S/Replica.swift|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation) + unanswered|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation)|local edits are visible before they sync'
-  '$S/Replica.swift|        if let running = inFlight { return try await running.value }|        _ = inFlight|concurrent sync calls share one push'
+  '$S/Replica.swift|        guard let running = inFlight else { return try await startOrJoin() }|        guard let running = Optional<Task<SyncReport, any Error>>.none else { return try await startOrJoin() }|concurrent sync calls join the running sync'
   '$S/Replica.swift|        } catch {\n            pushFailure = error\n        }|        } catch {\n            throw error\n        }|a failed push does not stop the pull'
   '$S/AgentToolSurface.swift|            guard let kind = schema.fields[field], let grant = policy.grant(for: field) else { return nil }|            guard let kind = schema.fields[field], let grant = Optional(policy.grant(for: field) ?? .direct) else { return nil }|the tool offers only the fields the actor may write'
   '$S/AgentToolSurface.swift|let delta = Int64(exactly: number),|let delta = Optional(Int64(number)),|a counter delta that does not fit Int64 is refused, not trapped'
@@ -43,6 +43,11 @@ MUTANTS=(
   '$S/Replica.swift|        let admitted = confirmed.appliedThrough[actor] ?? 0\n        if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }|        _ = confirmed|a pull moves the next key past edits the log already holds'
   '$S/AgentToolSurface.swift|                      delta >= -Self.maxCounterDelta, delta <= Self.maxCounterDelta else {|                      true else {|counter deltas beyond 2^53 - 1 are refused'
   '$S/AgentToolSurface.swift|        guard !editShapes.isEmpty else { return nil }|        _ = editShapes.isEmpty|a policy that offers nothing has no tool'
+  '$S/Replica.swift|        guard outbox.contains(where: { $0.id.clientSeq <= newestAtCall }) else { return report }|        if true { return report }|a joiner whose edit missed the running push gets another round'
+  '$S/Replica.swift|                if confirmed.version == cursor {\n                    report.pullStalled = true|                if confirmed.version == cursor {\n                    report.pullStalled = false|a page that makes no progress is reported'
+  '$S/Replica.swift|        guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }|        guard false else { return }|edits queued after a restore are re-keyed past the log'"'"'s keys'
+  '$S/Replica.swift|        if pullBeforeFirstPush {\n            try await pullToHead|        if false, pullBeforeFirstPush {\n            try await pullToHead|a restored replica pulls before its first push'
+  '$S/CommitLog.swift|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n        let body: Mutation? = nil\n|the replay window never holds the body'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then
