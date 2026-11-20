@@ -20,13 +20,17 @@ public enum ReplicaError: Error, Hashable, Sendable {
 /// `review` and `sync` (e.g. as JSON in a file or a SQLite row) and pass it back to
 /// `Replica(actor:transport:restoring:)`. The library does no I/O itself.
 ///
-/// It must be saved *before* the edit it covers can reach the network: a replica that
-/// restarts from an older state may hand out an idempotency key the server has already
-/// seen. A restored replica pulls before its first push and re-keys anything queued since
-/// the restore past every key the log holds, so those edits aren't lost. What it can't see
-/// is a key whose only outcome was a refusal (refusals never enter the log): an edit that
-/// reuses one is refused as `.idempotencyConflict`, or deduplicated into the old refusal
-/// if its body happens to be identical, and is lost.
+/// It must be saved *before* the edit it covers can reach the network. A replica restarted
+/// from an older save may hand out an idempotency key the server already holds. Edits
+/// queued since a restore are therefore pushed one at a time under their original keys:
+/// if the server holds that key for the *same* edit (a later incarnation already sent it)
+/// it replays the outcome, so nothing applies twice; if it holds it for a *different* edit
+/// it answers `.idempotencyConflict`, which proves this edit was never applied under it, and
+/// the replica re-keys it and everything behind it and stops (`SyncReport.rekeyed`), so the
+/// host saves the new keys before the next sync sends them. What it can't recover: a fresh
+/// edit identical to an old edit under the same key is taken to be that edit, and a fresh
+/// key older than the server's replay window gets `.retryExpired`; in both cases that edit
+/// is reported refused rather than risk applying something twice.
 public struct ReplicaState: Hashable, Sendable, Codable {
     public let actor: ActorID
     public let confirmed: Snapshot
@@ -67,6 +71,12 @@ public struct SyncReport: Hashable, Sendable {
     /// server reported more, or the page budget ran out. A server that keeps doing this is
     /// broken, and the host should surface it rather than keep calling `sync()` silently.
     public var pullStalled = false
+    /// An edit queued since a restore hit a key the server holds for a different edit, so it
+    /// and everything behind it got new idempotency keys and the push stopped there.
+    /// Persist `persistentState()` now, then sync again: a re-keyed edit is never sent before
+    /// the host has had the chance to save its new key, so a crash can't make it go out
+    /// under two different keys.
+    public var rekeyed = false
     public init() {}
 }
 
@@ -107,12 +117,13 @@ public actor Replica {
     private var committedAhead: [CommittedEdit] = []
     private var rejections: [RejectedEdit] = []
     private var inFlight: Task<SyncReport, any Error>?
-    /// Set by `init(restoring:)`: the first sync pulls before it pushes, so keys the log
-    /// already holds are skipped before anything queued since the save goes out.
     /// Non-nil from `init(restoring:)` until a pull reaches the head: outbox keys at or
     /// above it have never been sent (see `ReplicaState.freshFrom`); keys below it came from
     /// the saved outbox and may already be on the server, so they are never re-keyed.
     private var freshFrom: UInt64?
+    /// The highest of this replica's keys the server has answered for (admitted, refused
+    /// or replayed). Used as a floor when re-keying.
+    private var highestKeySeenUsed: UInt64 = 0
     /// How many `sync()` calls joined a sync that was already running. Observed by tests.
     private(set) var joinedSyncs = 0
     /// Pages one sync may pull before reporting `pullStalled`. Internal so tests can lower it.
@@ -218,43 +229,65 @@ public actor Replica {
         // A failed push doesn't stop the pull: with writes refused but reads working (a
         // partial outage), the replica still rebases its pending edits onto fresh state.
         // The push error is still thrown, after the pull, so the caller knows to retry.
-        if freshFrom != nil {
-            try await pullToHead(into: &report) // throws before anything is pushed
-            // Re-keying is only sound against the whole log. If the pull stopped short of the
-            // head, push nothing; the next sync pulls first again.
-            if report.pullStalled { return report }
-            rekeyEditsQueuedSinceRestore()
-            freshFrom = nil
-        }
         var pushFailure: (any Error)?
+        var taken: Mutation?
         do {
-            try await pushOutbox(into: &report)
+            taken = try await pushOutbox(into: &report)
         } catch {
             pushFailure = error
         }
         try await pullToHead(into: &report)
+        // Re-key after the pull, so the new keys start past everything the log now shows.
+        if let taken {
+            rekey(from: taken)
+            report.rekeyed = true
+        }
+        // The boundary is no longer needed once no edit queued since the restore remains.
+        if let boundary = freshFrom, !outbox.contains(where: { $0.id.clientSeq >= boundary }) { freshFrom = nil }
         if let pushFailure { throw pushFailure }
         return report
     }
 
-    private func pushOutbox(into report: inout SyncReport) async throws {
+    /// Pushes until the outbox is empty or a round makes no progress. Returns an edit queued
+    /// since a restore whose key turned out to be taken; pushing stops there, and the caller
+    /// re-keys it after pulling. Nothing re-keyed is sent before the host can save it.
+    private func pushOutbox(into report: inout SyncReport) async throws -> Mutation? {
         // Bounded: each round either removes at least one mutation from the outbox or stops.
-        while !outbox.isEmpty {
-            let batch = Array(outbox.prefix(pushBatchSize))
+        while let head = outbox.first {
+            // An edit queued since a restore is sent on its own: if its key turns out to be
+            // taken, nothing queued behind it may be admitted first (that would reorder edits).
+            let headIsFresh = freshFrom.map { head.id.clientSeq >= $0 } ?? false
+            let batch = headIsFresh ? [head] : Array(outbox.prefix(while: { mutation in
+                freshFrom.map { mutation.id.clientSeq < $0 } ?? true
+            }).prefix(pushBatchSize))
             let results = try await transport.push(batch)
             // Edits made while the push was in flight were appended behind the batch, and
             // results are matched by idempotency key, so they can't be mistaken for answered ones.
             let before = outbox.count
-            for result in results { settle(result, report: &report) }
-            if outbox.count == before { return }
+            var conflict: Mutation?
+            for result in results {
+                if let taken = settle(result, report: &report) { conflict = taken }
+            }
+            if let conflict { return conflict }
+            if outbox.count == before { return nil }
         }
+        return nil
     }
 
-    private func settle(_ result: PushResult, report: inout SyncReport) {
+    /// Applies one push result. Returns the mutation if it is an edit queued since a restore
+    /// whose key the server already holds for a *different* edit (it stays queued, to be
+    /// re-keyed); nil otherwise.
+    private func settle(_ result: PushResult, report: inout SyncReport) -> Mutation? {
         guard let index = outbox.firstIndex(where: { $0.id == result.id }), outbox.indices.contains(index) else {
-            return // an answer for something already settled (e.g. a duplicated response)
+            return nil // an answer for something already settled (e.g. a duplicated response)
         }
         let mutation = outbox[index]
+        switch result.outcome {
+        case .committed, .proposed, .rejected(.retryExpired), .rejected(.idempotencyConflict):
+            highestKeySeenUsed = max(highestKeySeenUsed, mutation.id.clientSeq)
+        default:
+            break
+        }
         switch result.outcome {
         case let .committed(seq):
             outbox.remove(at: index)
@@ -265,6 +298,10 @@ public actor Replica {
             report.proposed += 1
         case .rejected(.batchTooLarge):
             break // not looked at by the server: stays queued for the next round
+        case .rejected(.idempotencyConflict) where freshFrom.map({ mutation.id.clientSeq >= $0 }) ?? false:
+            // Queued since a restore, and the key belongs to another edit (the server compared
+            // bodies), so this edit was never applied under it: safe to give it a new key.
+            return mutation
         case let .rejected(reason):
             outbox.remove(at: index)
             report.rejected += 1
@@ -275,6 +312,7 @@ public actor Replica {
         case .outOfOrder:
             report.stalled = true
         }
+        return nil
     }
 
     private func pullToHead(into report: inout SyncReport) async throws {
@@ -314,21 +352,19 @@ public actor Replica {
         report.pullStalled = true // page budget exhausted before reaching the head
     }
 
-    /// Edits queued after `init(restoring:)` have never been sent (the first sync pulls
-    /// first). If any of their keys is one the log already holds, give all of them, in
-    /// order, fresh keys after both the log's and the saved outbox's highest key.
-    private func rekeyEditsQueuedSinceRestore() {
-        let admitted = confirmed.appliedThrough[actor] ?? 0
-        guard let boundary = freshFrom else { return }
-        let fresh = outbox.indices.filter { outbox[$0].id.clientSeq >= boundary }
-        guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }
-        // Every restored key is below every fresh key, so if a fresh key is <= admitted,
-        // all restored keys are too: starting right after `admitted` collides with nothing.
-        let start = admitted
+    /// Gives `taken` and every edit queued behind it new keys, in order, after every key known
+    /// to be used: the taken key, the log's highest key for this actor, and every key the
+    /// server has answered for. A new key can still land on a key whose only outcome was a
+    /// refusal (refusals never enter the log); the server then reports another conflict and
+    /// the next round moves past it.
+    private func rekey(from taken: Mutation) {
+        guard let start = outbox.firstIndex(where: { $0.id == taken.id }) else { return }
+        let floor = max(taken.id.clientSeq, highestKeySeenUsed, confirmed.appliedThrough[actor] ?? 0)
+        let count = outbox.count - start
         // Bounded by the outbox cap, far from UInt64.max; checked anyway.
-        guard start < UInt64.max - UInt64(fresh.count) else { return }
-        var next = start + 1
-        for index in fresh where outbox.indices.contains(index) {
+        guard floor < UInt64.max - UInt64(count) else { return }
+        var next = floor + 1
+        for index in start..<outbox.count where outbox.indices.contains(index) {
             outbox[index] = Mutation(id: MutationID(actor: actor, clientSeq: next), body: outbox[index].body)
             next += 1
         }
@@ -342,7 +378,8 @@ public actor Replica {
 
     /// If the log already holds this actor's mutations up to some sequence number (for
     /// instance after a relaunch from an older save), never hand out those numbers again.
-    /// Edits queued before that pull are handled by `rekeyEditsQueuedSinceRestore()`.
+    /// Edits queued before that pull whose keys turn out to be taken are re-keyed on conflict
+    /// (see `rekey(from:)`).
     private func bumpSequencePastAdmittedEdits() {
         let admitted = confirmed.appliedThrough[actor] ?? 0
         if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }

@@ -69,6 +69,10 @@ final class PersistenceTests: XCTestCase {
         // Queued before the first sync, with the key ben#1 that the log already holds.
         let queued = try await restarted.write(Names.item1, [.set(Names.notes, .text("second"))])
         XCTAssertEqual(queued.clientSeq, 1)
+        let first = try await restarted.sync()
+        XCTAssertTrue(first.rekeyed, "re-keyed, and nothing pushed until the host can save")
+        let untouched = await ws.server.snapshot().records[Names.item1]?[Names.notes]
+        XCTAssertEqual(untouched, .text("first"))
         try await restarted.sync()
         let rejections = await restarted.view().rejections
         XCTAssertTrue(rejections.isEmpty, "re-keyed, so not refused as an idempotency conflict")
@@ -94,6 +98,8 @@ final class PersistenceTests: XCTestCase {
         // Relaunch #2, online: ben#1 is still recognised as fresh and re-keyed.
         await ws.benLink.setOnline(true)
         guard let second = Replica(actor: Names.ben, transport: ws.benLink, restoring: saved) else { return XCTFail("restore") }
+        let rekeying = try await second.sync()
+        XCTAssertTrue(rekeying.rekeyed)
         try await second.sync()
         let rejections = await second.view().rejections
         XCTAssertTrue(rejections.isEmpty)
@@ -103,23 +109,37 @@ final class PersistenceTests: XCTestCase {
         XCTAssertNil(after.freshFrom, "cleared once a pull reached the head")
     }
 
-    func testRestoredReplicaShowsItsFreshEditEvenWhileTheFirstPullIsIncomplete() async throws {
+    /// The host saves after every write and every sync, as `ReplicaState` asks, and the app
+    /// is killed right after each sync (before that save). The edit must still apply once.
+    func testACrashAfterEachSyncNeverAppliesAReKeyedEditTwice() async throws {
         let ws = Workspace()
+        try await ws.asha.write(Names.item1, [.add(Names.votes, 1)])
+        try await ws.asha.sync()
         let stale = await ws.ben.persistentState()
-        for text in ["a", "b", "c"] {
-            try await ws.ben.write(Names.item1, [.set(Names.notes, .text(text))])
-            try await ws.ben.sync()
+        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("ben#1 is taken"))])
+        try await ws.ben.sync()
+
+        func relaunch(_ state: ReplicaState) throws -> Replica {
+            let decoded = try JSONDecoder().decode(ReplicaState.self, from: JSONEncoder().encode(state))
+            guard let replica = Replica(actor: Names.ben, transport: ws.benLink, restoring: decoded) else {
+                throw ReplicaError.sequenceExhausted // stands in for "restore refused"
+            }
+            return replica
         }
-        guard let restored = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale, pullPageSize: 1) else {
-            return XCTFail("restore")
-        }
-        await restored.setPullPageBudget(1)
-        try await restored.write(Names.item1, [.set(Names.notes, .text("mine"))]) // key ben#1, like "a"
-        let report = try await restored.sync()
-        XCTAssertTrue(report.pullStalled)
-        let view = await restored.view()
-        XCTAssertEqual(view.visible.records[Names.item1]?[Names.notes], .text("mine"))
-        XCTAssertEqual(view.recordsWithLocalEdits, [Names.item1])
+
+        let r1 = try relaunch(stale)
+        try await r1.write(Names.item1, [.add(Names.votes, 10)]) // key ben#1: collides
+        let s1 = await r1.persistentState()                      // saved after the write
+        _ = try await r1.sync()                                   // killed before the next save
+        let r2 = try relaunch(s1)
+        let rekeying = try await r2.sync()
+        XCTAssertTrue(rekeying.rekeyed)
+        let s2 = await r2.persistentState()                      // saved after the sync
+        _ = try await r2.sync()                                   // pushes; killed before saving
+        let r3 = try relaunch(s2)
+        _ = try await r3.sync()                                   // replays the stored outcome
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(11), "the +10 applied exactly once")
     }
 
     func testRestoredOutboxKeepsItsKeysWhileNewEditsAreReKeyed() async throws {

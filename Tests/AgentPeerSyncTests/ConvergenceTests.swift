@@ -19,17 +19,19 @@ final class ConvergenceTests: XCTestCase {
     private let records = [Names.item1, Names.item2, Names.item3]
     private let faults: [LocalTransport.Fault] = [.dropRequest, .dropResponse, .duplicateRequest]
 
-    private func randomEdit(for actor: ActorID, using rng: inout SeededGenerator) -> [FieldOp] {
+    /// Every text value is unique (`#n`), so the log can be checked for one logical edit
+    /// landing twice under different keys, which an id-only check can't see.
+    private func randomEdit(for actor: ActorID, unique n: Int, using rng: inout SeededGenerator) -> [FieldOp] {
         if actor == Names.agent {
             switch Int.random(in: 0..<3, using: &rng) {
-            case 0: return [.set(Names.summary, .text("s\(Int.random(in: 0..<9, using: &rng))"))]
-            case 1: return [.set(Names.title, .text("agent \(Int.random(in: 0..<9, using: &rng))"))]
-            default: return [.set(Names.notes, .text("agent notes"))]
+            case 0: return [.set(Names.summary, .text("s#\(n)"))]
+            case 1: return [.set(Names.title, .text("agent t#\(n)"))]
+            default: return [.set(Names.notes, .text("agent n#\(n)"))]
             }
         }
         switch Int.random(in: 0..<10, using: &rng) {
-        case 0..<3: return [.set(Names.title, .text("t\(Int.random(in: 0..<99, using: &rng))"))]
-        case 3..<5: return [.set(Names.notes, .text("n\(Int.random(in: 0..<99, using: &rng))"))]
+        case 0..<3: return [.set(Names.title, .text("t#\(n)"))]
+        case 3..<5: return [.set(Names.notes, .text("n#\(n)"))]
         case 5: return [.set(Names.done, .flag(Bool.random(using: &rng)))]
         case 6: return [.delete]
         default: return [.add(Names.votes, Int64.random(in: -2...3, using: &rng))]
@@ -49,19 +51,23 @@ final class ConvergenceTests: XCTestCase {
         let ws = Workspace(configuration: configuration)
         let links = [ws.ashaLink, ws.benLink, ws.agentLink]
         var replicas = ws.replicas
-        // The last state each replica's "app" saved; a relaunch restores from it, so it is
-        // often older than the replica it replaces (a stale save).
-        var saved: [ReplicaState?] = Array(repeating: nil, count: replicas.count)
+        // Each replica's "app" follows the `ReplicaState` contract: it saves after every write,
+        // review and sync. A crash is the app dying right after an action, before that save,
+        // and relaunching from the previous one, so the restored state is one action stale.
+        var saved: [ReplicaState] = []
+        for replica in replicas { saved.append(await replica.persistentState()) }
+        var editNumber = 0
 
         for _ in 0..<steps {
             let index = Int.random(in: 0..<replicas.count, using: &rng)
             guard replicas.indices.contains(index), links.indices.contains(index) else { continue }
             let replica = replicas[index]
             let link = links[index]
-            switch Int.random(in: 0..<12, using: &rng) {
+            switch Int.random(in: 0..<10, using: &rng) {
             case 0..<5:
                 let record = records[Int.random(in: 0..<records.count, using: &rng)]
-                try await replica.write(record, randomEdit(for: replica.actor, using: &rng))
+                editNumber += 1
+                try await replica.write(record, randomEdit(for: replica.actor, unique: editNumber, using: &rng))
             case 5:
                 if let proposal = await replica.view().confirmed.openProposals.randomElement(using: &rng) {
                     try await replica.review(proposal.seq, Bool.random(using: &rng) ? .accept : .reject)
@@ -70,20 +76,6 @@ final class ConvergenceTests: XCTestCase {
                 await link.setOnline(!(await link.isOnline))
             case 7:
                 await link.injectOnNextPush(faults[Int.random(in: 0..<faults.count, using: &rng)])
-            case 10:
-                saved[index] = await replica.persistentState()
-            case 11:
-                // Relaunch: JSON round-trip of the last save (or of the current state).
-                let current = await replica.persistentState()
-                let state = saved[index] ?? current
-                let data = try JSONEncoder().encode(state)
-                let decoded = try JSONDecoder().decode(ReplicaState.self, from: data)
-                guard let restored = Replica(actor: replica.actor, transport: link, restoring: decoded) else {
-                    XCTFail("seed \(seed): a saved state was refused on restore")
-                    continue
-                }
-                replicas[index] = restored
-                stats.relaunches += 1
             default:
                 if let report = try? await replica.sync() {
                     stats.committed += report.committed
@@ -91,6 +83,21 @@ final class ConvergenceTests: XCTestCase {
                     stats.rejected += report.rejected
                     if report.resetFromSnapshot { stats.snapshotResets += 1 }
                 }
+            }
+
+            // Save, or crash before saving and relaunch from the last save (JSON round trip).
+            guard saved.indices.contains(index) else { continue }
+            if Int.random(in: 0..<8, using: &rng) == 0 {
+                let data = try JSONEncoder().encode(saved[index])
+                let decoded = try JSONDecoder().decode(ReplicaState.self, from: data)
+                guard let restored = Replica(actor: replica.actor, transport: link, restoring: decoded) else {
+                    XCTFail("seed \(seed): a saved state was refused on restore")
+                    continue
+                }
+                replicas[index] = restored
+                stats.relaunches += 1
+            } else {
+                saved[index] = await replica.persistentState()
             }
         }
 
@@ -126,6 +133,7 @@ final class ConvergenceTests: XCTestCase {
         }
         guard let total = Int(exactly: truth.version), entries.count == total else { return stats } // compacted: skip log checks
         var seen = Set<MutationID>()
+        var seenTexts = Set<String>()
         var lastPerActor: [ActorID: UInt64] = [:]
         for entry in entries {
             let id: MutationID
@@ -134,6 +142,12 @@ final class ConvergenceTests: XCTestCase {
             case let .resolved(_, _, by): id = by
             }
             XCTAssertTrue(seen.insert(id).inserted, "seed \(seed): \(id) admitted twice")
+            // The same logical edit under two different keys (e.g. re-keyed and resent).
+            if case let .committed(m) = entry.event, case let .write(_, ops, _) = m.body {
+                for case let .set(_, .text(text)) in ops {
+                    XCTAssertTrue(seenTexts.insert(text).inserted, "seed \(seed): edit \(text) applied twice")
+                }
+            }
             XCTAssertGreaterThan(id.clientSeq, lastPerActor[id.actor] ?? 0, "seed \(seed): \(id) out of order")
             lastPerActor[id.actor] = id.clientSeq
         }
