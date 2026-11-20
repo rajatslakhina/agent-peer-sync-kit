@@ -299,74 +299,21 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(cursor, 2)
     }
 
-    func testAFreshEditWithATakenKeyIsReKeyedWithoutLettingLaterEditsOvertakeIt() async throws {
+    func testAfterARelaunchALostResponseStillIsNotCountedTwice() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])
         try await ws.asha.sync()
-        let stale = await ws.ben.persistentState()
-        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("old"))]) // takes ben#1
         try await ws.ben.sync()
-
-        let link = ControllableTransport(server: ws.server, identity: Names.ben)
-        guard let restored = Replica(actor: Names.ben, transport: link, restoring: stale) else {
+        guard let ben = Replica(actor: Names.ben, transport: ws.benLink, restoring: await ws.ben.persistentState()) else {
             return XCTFail("restore")
         }
-        try await restored.write(Names.item1, [.set(Names.notes, .text("first"))])  // ben#1: taken
-        try await restored.write(Names.item1, [.set(Names.notes, .text("second"))]) // ben#2: free
-        let report = try await restored.sync()
-        XCTAssertTrue(report.rekeyed)
-        let pushes = await link.pushCount
-        XCTAssertEqual(pushes, 1, "the fresh edit went alone, so ben#2 wasn't admitted ahead of it")
-        let unchanged = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(unchanged, .text("old"))
-
-        try await restored.sync()
-        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(notes, .text("second"), "applied in the order they were made")
-        let rejections = await restored.view().rejections
-        XCTAssertTrue(rejections.isEmpty)
-    }
-
-    func testReKeyingStartsPastEveryKeyTheLogShowsSoOneRoundIsEnough() async throws {
-        let ws = Workspace()
-        let stale = await ws.ben.persistentState()
-        for text in ["a", "b", "c"] { // ben#1...#3 taken
-            try await ws.ben.write(Names.item1, [.set(Names.notes, .text(text))])
-            try await ws.ben.sync()
-        }
-        guard let restored = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else {
-            return XCTFail("restore")
-        }
-        let queued = try await restored.write(Names.item1, [.set(Names.notes, .text("mine"))])
-        XCTAssertEqual(queued.clientSeq, 1)
-        let first = try await restored.sync()
-        XCTAssertTrue(first.rekeyed)
-        let rekeyed = await restored.view().outbox.map(\.id.clientSeq)
-        XCTAssertEqual(rekeyed, [4], "past ben#3, which the pull after the conflict revealed")
-        let second = try await restored.sync()
-        XCTAssertEqual(second.committed, 1)
-        XCTAssertFalse(second.rekeyed)
-    }
-
-    func testRestoredReplicaShowsItsFreshEditEvenWhenThePullRevealsItsKeyAsTaken() async throws {
-        let ws = Workspace()
-        let stale = await ws.ben.persistentState()
-        for text in ["a", "b", "c"] { // ben#1...#3 taken
-            try await ws.ben.write(Names.item1, [.set(Names.notes, .text(text))])
-            try await ws.ben.sync()
-        }
-        let link = ControllableTransport(server: ws.server, identity: Names.ben)
-        guard let restored = Replica(actor: Names.ben, transport: link, restoring: stale) else {
-            return XCTFail("restore")
-        }
-        try await restored.write(Names.item1, [.set(Names.notes, .text("mine"))]) // key ben#1, like "a"
-        await link.setFailPushes(true) // reads work, writes don't: the pull reveals ben#1..#3
-        do { try await restored.sync(); XCTFail("push should fail") } catch {}
-        let view = await restored.view()
-        XCTAssertEqual(view.confirmed.appliedThrough[Names.ben], 3)
-        XCTAssertEqual(view.visible.records[Names.item1]?[Names.notes], .text("mine"),
-                       "ben#1 in the log is a different edit, so this one is still unanswered")
-        XCTAssertEqual(view.recordsWithLocalEdits, [Names.item1])
+        try await ben.write(Names.item1, [.add(Names.votes, 1)])
+        await ws.benLink.injectOnNextPush(.dropResponse)
+        do { try await ben.sync(); XCTFail("response dropped") } catch {}
+        let view = await ben.view()
+        XCTAssertEqual(view.confirmed.records[Names.item1]?[Names.votes], .count(1))
+        XCTAssertEqual(view.visible.records[Names.item1]?[Names.votes], .count(1))
+        XCTAssertEqual(view.outbox.count, 1, "still queued until a push learns the outcome")
     }
 
     func testASyncAfterAFinishedSyncStartsFresh() async throws {

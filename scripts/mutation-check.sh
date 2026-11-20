@@ -25,7 +25,7 @@ MUTANTS=(
   '$S/State.swift|        appliedThrough[author.actor] = max(appliedThrough[author.actor] ?? 0, author.clientSeq)|        _ = author|the reducer records which edits the log already holds'
   '$S/Replica.swift|            if seq > confirmed.version { committedAhead.append(CommittedEdit(mutation: mutation, seq: seq)) }|            _ = seq|an acknowledged edit stays visible until it is pulled'
   '$S/Replica.swift|        committedAhead.removeAll { $0.seq <= confirmed.version }|        committedAhead.removeAll { _ in false }|pulled commits leave the overlay so newer remote values show'
-  '$S/Replica.swift|            return mutation.id.clientSeq > admitted|            return true|an edit whose response was lost is not counted twice'
+  '$S/Replica.swift|        let unanswered = outbox.filter { $0.id.clientSeq > admitted }|        let unanswered = outbox|an edit whose response was lost is not counted twice'
   '$S/Replica.swift|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation) + unanswered|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation)|local edits are visible before they sync'
   '$S/Replica.swift|        guard let running = inFlight else { return try await startOrJoin() }|        guard let running = Optional<Task<SyncReport, any Error>>.none else { return try await startOrJoin() }|concurrent sync calls join the running sync'
   '$S/Replica.swift|        } catch {\n            pushFailure = error\n        }|        } catch {\n            throw error\n        }|a failed push does not stop the pull'
@@ -49,13 +49,8 @@ MUTANTS=(
   '$S/Replica.swift|state.actor == actor, state.nextSeq >= 1,|state.actor == actor,|a restored state with nextSeq 0 is refused'
   '$S/Replica.swift|        report.pullStalled = true // page budget exhausted before reaching the head\n||running out of page budget is reported'
   '$S/AgentToolSurface.swift|        if policy.mayDelete { lines.append(|        if false, policy.mayDelete { lines.append(|the tool description mentions delete when it is offered'
-  '$S/Replica.swift|            if let boundary = freshFrom, mutation.id.clientSeq >= boundary { return true }\n||a restored replica shows its fresh edits before its first full pull'
-  '$S/Replica.swift|        freshFrom = state.freshFrom.map { min($0, next) } ?? next|        freshFrom = next|the fresh-key boundary survives a second relaunch'
   '$S/CommitLog.swift|        public var outcomeRetention: Int { didSet { outcomeRetention = min(max(outcomeRetention, 1), 100_000) } }|        public var outcomeRetention: Int|configuration set after init is clamped'
-  '$S/Replica.swift|        case .rejected(.idempotencyConflict) where freshFrom.map({ mutation.id.clientSeq >= $0 }) ?? false:|        case .rejected(.idempotencyConflict) where false:|a fresh edit whose key is taken is re-keyed, not refused'
-  '$S/Replica.swift|            if let conflict { return conflict }|            if let conflict { rekey(from: conflict) }|a re-keyed edit is never sent in the sync that re-keyed it'
-  '$S/Replica.swift|headIsFresh ? [head]|headIsFresh ? Array(outbox.prefix(pushBatchSize))|an edit queued since a restore is pushed alone'
-  '$S/Replica.swift|        let floor = max(taken.id.clientSeq, highestKeySeenUsed, confirmed.appliedThrough[actor] ?? 0)|        let floor = taken.id.clientSeq|re-keying starts past every key the log shows'
+  '$S/Replica.swift|            if let persist { try await persist(persistentState()) }|            _ = persist|the persist handler stores the state before every push'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then

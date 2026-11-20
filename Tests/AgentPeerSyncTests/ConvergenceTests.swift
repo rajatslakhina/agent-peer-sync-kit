@@ -2,6 +2,18 @@
 import AgentPeerSyncTesting
 import XCTest
 
+/// The last few states each replica's app saved.
+private actor SaveHistory {
+    private var states: [Int: [ReplicaState]] = [:]
+    func put(_ index: Int, _ state: ReplicaState) {
+        var list = states[index] ?? []
+        list.append(state)
+        if list.count > 4 { list.removeFirst(list.count - 4) }
+        states[index] = list
+    }
+    func history(_ index: Int) -> [ReplicaState] { states[index] ?? [] }
+}
+
 /// SplitMix64: a tiny deterministic generator, so a failing seed can be replayed.
 private struct SeededGenerator: RandomNumberGenerator {
     private var state: UInt64
@@ -29,19 +41,20 @@ final class ConvergenceTests: XCTestCase {
             default: return [.set(Names.notes, .text("agent n#\(n)"))]
             }
         }
+        // Non-text changes carry a unique note too, so counter adds and flags are covered.
         switch Int.random(in: 0..<10, using: &rng) {
         case 0..<3: return [.set(Names.title, .text("t#\(n)"))]
         case 3..<5: return [.set(Names.notes, .text("n#\(n)"))]
-        case 5: return [.set(Names.done, .flag(Bool.random(using: &rng)))]
+        case 5: return [.set(Names.done, .flag(Bool.random(using: &rng))), .set(Names.notes, .text("d#\(n)"))]
         case 6: return [.delete]
-        default: return [.add(Names.votes, Int64.random(in: -2...3, using: &rng))]
+        default: return [.add(Names.votes, Int64.random(in: -2...3, using: &rng)), .set(Names.notes, .text("v#\(n)"))]
         }
     }
 
     /// Random offline edits, reviews, connectivity changes and transport faults across two
     /// phones and an agent; then everyone reconnects. Checks the properties the README claims.
     struct Stats {
-        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0, relaunches = 0
+        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0, relaunches = 0, staleRelaunches = 0
     }
 
     @discardableResult
@@ -50,12 +63,19 @@ final class ConvergenceTests: XCTestCase {
         var rng = SeededGenerator(seed: seed)
         let ws = Workspace(configuration: configuration)
         let links = [ws.ashaLink, ws.benLink, ws.agentLink]
-        var replicas = ws.replicas
-        // Each replica's "app" follows the `ReplicaState` contract: it saves after every write,
-        // review and sync. A crash is the app dying right after an action, before that save,
-        // and relaunching from the previous one, so the restored state is one action stale.
-        var saved: [ReplicaState] = []
-        for replica in replicas { saved.append(await replica.persistentState()) }
+        // Each replica's "app" saves after most actions, and the replica's persist handler saves
+        // before every push (write-ahead). A crash relaunches from the latest save, or now and
+        // then from an older one (a lost save or a backup restore), which may lose edits but
+        // must never apply one twice.
+        let saves = SaveHistory()
+        let actors = [Names.asha, Names.ben, Names.agent]
+        func handler(_ index: Int) -> Replica.PersistHandler { { await saves.put(index, $0) } }
+        var replicas: [Replica] = []
+        for (index, actor) in actors.enumerated() where links.indices.contains(index) {
+            let replica = Replica(actor: actor, transport: links[index], persist: handler(index))
+            replicas.append(replica)
+            await saves.put(index, await replica.persistentState())
+        }
         var editNumber = 0
 
         for _ in 0..<steps {
@@ -76,6 +96,11 @@ final class ConvergenceTests: XCTestCase {
                 await link.setOnline(!(await link.isOnline))
             case 7:
                 await link.injectOnNextPush(faults[Int.random(in: 0..<faults.count, using: &rng)])
+            case 8:
+                // Two syncs at once on the same replica (they coalesce).
+                async let first = try? replica.sync()
+                async let second = try? replica.sync()
+                _ = await (first, second)
             default:
                 if let report = try? await replica.sync() {
                     stats.committed += report.committed
@@ -85,19 +110,24 @@ final class ConvergenceTests: XCTestCase {
                 }
             }
 
-            // Save, or crash before saving and relaunch from the last save (JSON round trip).
-            guard saved.indices.contains(index) else { continue }
+            // Save, or crash and relaunch from a save (JSON round trip).
             if Int.random(in: 0..<8, using: &rng) == 0 {
-                let data = try JSONEncoder().encode(saved[index])
+                let history = await saves.history(index)
+                let stale = history.count > 1 && Int.random(in: 0..<4, using: &rng) == 0
+                let pick = stale ? Int.random(in: 0..<(history.count - 1), using: &rng) : history.count - 1
+                guard history.indices.contains(pick) else { continue }
+                if stale { stats.staleRelaunches += 1 }
+                let data = try JSONEncoder().encode(history[pick])
                 let decoded = try JSONDecoder().decode(ReplicaState.self, from: data)
-                guard let restored = Replica(actor: replica.actor, transport: link, restoring: decoded) else {
+                guard let restored = Replica(actor: replica.actor, transport: link, restoring: decoded,
+                                             persist: handler(index)) else {
                     XCTFail("seed \(seed): a saved state was refused on restore")
                     continue
                 }
                 replicas[index] = restored
                 stats.relaunches += 1
             } else {
-                saved[index] = await replica.persistentState()
+                await saves.put(index, await replica.persistentState())
             }
         }
 
@@ -143,7 +173,12 @@ final class ConvergenceTests: XCTestCase {
             }
             XCTAssertTrue(seen.insert(id).inserted, "seed \(seed): \(id) admitted twice")
             // The same logical edit under two different keys (e.g. re-keyed and resent).
-            if case let .committed(m) = entry.event, case let .write(_, ops, _) = m.body {
+            if case let .write(_, ops, _) = { () -> MutationBody? in
+                switch entry.event {
+                case let .committed(m), let .proposed(m): return m.body
+                case .resolved: return nil
+                }
+            }() {
                 for case let .set(_, .text(text)) in ops {
                     XCTAssertTrue(seenTexts.insert(text).inserted, "seed \(seed): edit \(text) applied twice")
                 }
@@ -163,13 +198,15 @@ final class ConvergenceTests: XCTestCase {
             total.resolved += stats.resolved
             total.rejected += stats.rejected
             total.relaunches += stats.relaunches
+            total.staleRelaunches += stats.staleRelaunches
         }
         // Guard against a schedule that silently stops exercising the interesting paths.
-        XCTAssertGreaterThan(total.committed, 500)
+        XCTAssertGreaterThan(total.committed, 250)
         XCTAssertGreaterThan(total.proposed, 25)
         XCTAssertGreaterThan(total.resolved, 10)
         XCTAssertGreaterThan(total.rejected, 25)
         XCTAssertGreaterThan(total.relaunches, 50, "replicas really were relaunched from saved state")
+        XCTAssertGreaterThan(total.staleRelaunches, 5, "some relaunches used an older save")
     }
 
     func testRandomSchedulesConvergeThroughCompactionAndASmallReplayWindow() async throws {

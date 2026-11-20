@@ -2,6 +2,16 @@
 import AgentPeerSyncTesting
 import XCTest
 
+/// Records the states a persist handler is given.
+private actor StateStore {
+    private(set) var latest: ReplicaState?
+    private(set) var count = 0
+    func put(_ state: ReplicaState) {
+        latest = state
+        count += 1
+    }
+}
+
 /// A server stand-in that drops the second entry of every page, leaving a gap after the first.
 private struct GappyTransport: SyncTransport {
     let server: CommitLog
@@ -58,91 +68,83 @@ final class PersistenceTests: XCTestCase {
         XCTAssertNotNil(Replica(actor: Names.ben, transport: ws.benLink, restoring: state))
     }
 
-    func testEditQueuedAfterRestoringAStaleSaveIsReKeyedNotLost() async throws {
+    func testAStaleSaveCanLoseAnEditButNeverAppliesOneTwice() async throws {
         let ws = Workspace()
-        let stale = await ws.ben.persistentState() // saved before the edit below: the mistake
-        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("first"))])
+        let stale = await ws.ben.persistentState() // older than what reached the server: the mistake
+        try await ws.ben.write(Names.item1, [.set(Names.done, .flag(true))]) // ben#1
         try await ws.ben.sync()
-        guard let restarted = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else {
-            return XCTFail("restore")
-        }
-        // Queued before the first sync, with the key ben#1 that the log already holds.
-        let queued = try await restarted.write(Names.item1, [.set(Names.notes, .text("second"))])
-        XCTAssertEqual(queued.clientSeq, 1)
-        let first = try await restarted.sync()
-        XCTAssertTrue(first.rekeyed, "re-keyed, and nothing pushed until the host can save")
-        let untouched = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(untouched, .text("first"))
-        try await restarted.sync()
-        let rejections = await restarted.view().rejections
-        XCTAssertTrue(rejections.isEmpty, "re-keyed, so not refused as an idempotency conflict")
-        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(notes, .text("second"))
-    }
-
-    func testAFreshEditSurvivesASecondRelaunchBeforeTheFirstPull() async throws {
-        let ws = Workspace()
-        let stale = await ws.ben.persistentState()
-        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("first"))])
-        try await ws.ben.sync()
-
-        // Relaunch #1 from the stale save, offline: the edit gets key ben#1 and can't sync.
-        await ws.benLink.setOnline(false)
-        guard let first = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else { return XCTFail("restore") }
-        let queued = try await first.write(Names.item1, [.set(Names.notes, .text("second"))])
-        XCTAssertEqual(queued.clientSeq, 1)
-        _ = try? await first.sync()
-        let saved = try JSONDecoder().decode(ReplicaState.self, from: JSONEncoder().encode(await first.persistentState()))
-        XCTAssertNotNil(saved.freshFrom, "the unverified boundary is saved")
-
-        // Relaunch #2, online: ben#1 is still recognised as fresh and re-keyed.
-        await ws.benLink.setOnline(true)
-        guard let second = Replica(actor: Names.ben, transport: ws.benLink, restoring: saved) else { return XCTFail("restore") }
-        let rekeying = try await second.sync()
-        XCTAssertTrue(rekeying.rekeyed)
-        try await second.sync()
-        let rejections = await second.view().rejections
-        XCTAssertTrue(rejections.isEmpty)
-        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
-        XCTAssertEqual(notes, .text("second"))
-        let after = await second.persistentState()
-        XCTAssertNil(after.freshFrom, "cleared once a pull reached the head")
-    }
-
-    /// The host saves after every write and every sync, as `ReplicaState` asks, and the app
-    /// is killed right after each sync (before that save). The edit must still apply once.
-    func testACrashAfterEachSyncNeverAppliesAReKeyedEditTwice() async throws {
-        let ws = Workspace()
-        try await ws.asha.write(Names.item1, [.add(Names.votes, 1)])
         try await ws.asha.sync()
-        let stale = await ws.ben.persistentState()
-        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("ben#1 is taken"))])
-        try await ws.ben.sync()
+        try await ws.asha.write(Names.item1, [.set(Names.done, .flag(false))])
+        try await ws.asha.sync()
 
-        func relaunch(_ state: ReplicaState) throws -> Replica {
-            let decoded = try JSONDecoder().decode(ReplicaState.self, from: JSONEncoder().encode(state))
-            guard let replica = Replica(actor: Names.ben, transport: ws.benLink, restoring: decoded) else {
-                throw ReplicaError.sequenceExhausted // stands in for "restore refused"
-            }
-            return replica
-        }
+        // A different edit under the reused key ben#1: refused, listed, not applied.
+        guard let differs = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else { return XCTFail("restore") }
+        try await differs.write(Names.item1, [.set(Names.notes, .text("lost"))])
+        let refused = try await differs.sync()
+        XCTAssertEqual(refused.rejected, 1)
+        let reasons = await differs.view().rejections.map(\.reason)
+        XCTAssertEqual(reasons, [.idempotencyConflict])
+        var record = await ws.server.snapshot().records[Names.item1]
+        XCTAssertNil(record?[Names.notes])
 
-        let r1 = try relaunch(stale)
-        try await r1.write(Names.item1, [.add(Names.votes, 10)]) // key ben#1: collides
-        let s1 = await r1.persistentState()                      // saved after the write
-        _ = try await r1.sync()                                   // killed before the next save
-        let r2 = try relaunch(s1)
-        let rekeying = try await r2.sync()
-        XCTAssertTrue(rekeying.rekeyed)
-        let s2 = await r2.persistentState()                      // saved after the sync
-        _ = try await r2.sync()                                   // pushes; killed before saving
-        let r3 = try relaunch(s2)
-        _ = try await r3.sync()                                   // replays the stored outcome
-        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
-        XCTAssertEqual(votes, .count(11), "the +10 applied exactly once")
+        // An identical edit under the reused key: taken to be ben#1, reported committed with
+        // the old outcome, and not applied again (Asha's later `done = false` stands).
+        guard let same = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else { return XCTFail("restore") }
+        try await same.write(Names.item1, [.set(Names.done, .flag(true))])
+        let replayed = try await same.sync()
+        XCTAssertEqual(replayed.committed, 1)
+        XCTAssertEqual(replayed.rejected, 0)
+        record = await ws.server.snapshot().records[Names.item1]
+        XCTAssertEqual(record?[Names.done], .flag(false))
     }
 
-    func testRestoredOutboxKeepsItsKeysWhileNewEditsAreReKeyed() async throws {
+    func testPersistHandlerStoresTheStateBeforeEveryPush() async throws {
+        let ws = Workspace()
+        let store = StateStore()
+        let ben = Replica(actor: Names.ben, transport: ws.benLink, persist: { await store.put($0) })
+        let id = try await ben.write(Names.item1, [.add(Names.votes, 1)])
+        try await ben.sync()
+        let saved = await store.latest
+        XCTAssertEqual(saved?.outbox.map(\.id), [id], "saved holding the key before the push")
+        let calls = await store.count
+        XCTAssertEqual(calls, 1)
+
+        // A failing save stops the push: nothing reaches the server.
+        let failing = Replica(actor: Names.asha, transport: ws.ashaLink, persist: { _ in throw TransportFailure("disk full") })
+        try await failing.write(Names.item2, [.add(Names.votes, 1)])
+        do { try await failing.sync(); XCTFail("persist failed, so sync must throw") } catch {}
+        let item2 = await ws.server.snapshot().records[Names.item2]
+        XCTAssertNil(item2)
+        let queued = await failing.view().outbox.count
+        XCTAssertEqual(queued, 1)
+    }
+
+    /// The host saves only now and then; the app dies right after a sync that pushed an
+    /// edit the host never saved. The persist handler's write-ahead save covers it.
+    func testACrashBeforeTheHostsOwnSaveIsSafeWithThePersistHandler() async throws {
+        let ws = Workspace()
+        try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])
+        try await ws.asha.sync()
+        let store = StateStore()
+        let hostSave = await ws.ben.persistentState() // the host's last own save: before the edit
+        let ben = Replica(actor: Names.ben, transport: ws.benLink, persist: { await store.put($0) })
+        try await ben.write(Names.item1, [.add(Names.votes, 10)])
+        _ = try await ben.sync() // pushes ben#1; the app dies before the host saves again
+
+        let state = await store.latest ?? hostSave
+        guard let relaunched = Replica(actor: Names.ben, transport: ws.benLink, restoring: state,
+                                       persist: { await store.put($0) }) else { return XCTFail("restore") }
+        try await relaunched.sync() // ben#1 replayed, not applied again
+        let next = try await relaunched.write(Names.item1, [.add(Names.votes, 1)])
+        XCTAssertEqual(next.clientSeq, 2, "the saved state knew ben#1 was taken")
+        try await relaunched.sync()
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(11))
+        let rejections = await relaunched.view().rejections
+        XCTAssertTrue(rejections.isEmpty)
+    }
+
+    func testRestoredOutboxKeepsItsKeysAndNewEditsGetFreshOnes() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])
         try await ws.asha.sync()
@@ -180,6 +182,16 @@ final class PersistenceTests: XCTestCase {
         try await restarted.sync()
         let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
         XCTAssertEqual(notes, .text("second"))
+    }
+
+    func testAStateSavedBy2_0_4WithFreshFromStillDecodes() throws {
+        let saved = ReplicaState(actor: Names.ben, confirmed: Snapshot(), nextSeq: 3, outbox: [], committedAhead: [])
+        guard case var .object(fields)? = JSONValue.parse(String(decoding: try JSONEncoder().encode(saved), as: UTF8.self)) else {
+            return XCTFail("a state encodes as a JSON object")
+        }
+        fields["freshFrom"] = .number(2) // the field 2.0.3 and 2.0.4 wrote
+        let decoded = try JSONDecoder().decode(ReplicaState.self, from: Data(JSONValue.object(fields).jsonString().utf8))
+        XCTAssertEqual(decoded, saved)
     }
 
     func testPendingEditsAreBounded() async throws {
