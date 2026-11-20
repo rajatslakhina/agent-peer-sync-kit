@@ -140,6 +140,19 @@ final class AdmissionTests: XCTestCase {
         XCTAssertEqual(huge.fields[Names.title], .text(maxLength: Schema.maxTextLimit, conflict: .rejectStale))
     }
 
+    func testDecodedPoliciesAndSchemasAreClampedLikeConstructedOnes() throws {
+        let policyJSON = #"{"kind":"agent","directFields":["summary"],"reviewedFields":[],"mayCreate":false,"mayDelete":false,"mayReview":false,"maxOpenProposals":1000000000}"#
+        let policy = try JSONDecoder().decode(ActorPolicy.self, from: Data(policyJSON.utf8))
+        XCTAssertEqual(policy.maxOpenProposals, ActorPolicy.maxOpenProposalsLimit)
+        let roundTrip = try JSONDecoder().decode(ActorPolicy.self, from: JSONEncoder().encode(SampleWorkspace.agentPolicy))
+        XCTAssertEqual(roundTrip, SampleWorkspace.agentPolicy)
+        // A dictionary keyed by a non-String type encodes as a flat [key, value, ...] array.
+        let schemaJSON = #"{"fields":["title",{"text":{"maxLength":9999999,"conflict":"rejectStale"}}],"maxOpsPerMutation":0}"#
+        let schema = try JSONDecoder().decode(Schema.self, from: Data(schemaJSON.utf8))
+        XCTAssertEqual(schema.maxOpsPerMutation, 1)
+        XCTAssertEqual(schema.fields[Names.title], .text(maxLength: Schema.maxTextLimit, conflict: .rejectStale))
+    }
+
     func testCounterAddSaturatesInsteadOfTrapping() {
         var records: [RecordID: Record] = [:]
         Snapshot.applyOps([.add(Names.votes, .max), .add(Names.votes, 1)], to: Names.item1, by: Names.asha, at: 1, in: &records)

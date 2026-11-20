@@ -53,6 +53,8 @@ final class PersistenceTests: XCTestCase {
         let rewound = ReplicaState(actor: state.actor, confirmed: state.confirmed, nextSeq: 1,
                                    outbox: state.outbox, committedAhead: state.committedAhead)
         XCTAssertNil(Replica(actor: Names.ben, transport: ws.benLink, restoring: rewound), "nextSeq behind the outbox")
+        let zero = ReplicaState(actor: state.actor, confirmed: state.confirmed, nextSeq: 0, outbox: [], committedAhead: [])
+        XCTAssertNil(Replica(actor: Names.ben, transport: ws.benLink, restoring: zero), "sequence numbers start at 1")
         XCTAssertNotNil(Replica(actor: Names.ben, transport: ws.benLink, restoring: state))
     }
 

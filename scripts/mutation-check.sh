@@ -48,6 +48,10 @@ MUTANTS=(
   '$S/Replica.swift|        guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }|        guard false else { return }|edits queued after a restore are re-keyed past the log'"'"'s keys'
   '$S/Replica.swift|        if pullBeforeFirstPush {\n            try await pullToHead|        if false, pullBeforeFirstPush {\n            try await pullToHead|a restored replica pulls before its first push'
   '$S/CommitLog.swift|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n        let body: Mutation? = nil\n|the replay window never holds the body'
+  '$S/Replica.swift|            if report.pullStalled { return report }\n            pullBeforeFirstPush = false|            pullBeforeFirstPush = false|a restored replica pushes nothing until its first pull reaches the head'
+  '$S/Replica.swift|state.actor == actor, state.nextSeq >= 1,|state.actor == actor,|a restored state with nextSeq 0 is refused'
+  '$S/Replica.swift|        report.pullStalled = true // page budget exhausted before reaching the head\n||running out of page budget is reported'
+  '$S/AgentToolSurface.swift|        if policy.mayDelete { lines.append(|        if false, policy.mayDelete { lines.append(|the tool description mentions delete when it is offered'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then

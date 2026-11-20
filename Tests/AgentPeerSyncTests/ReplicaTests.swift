@@ -285,6 +285,42 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(cursor, 0)
     }
 
+    func testPageBudgetRunningOutIsReportedAsStalled() async throws {
+        let server = makeServer()
+        let writer = Replica(actor: Names.asha, transport: LocalTransport(server: server, authenticatedAs: Names.asha))
+        for _ in 0..<5 { try await writer.write(Names.item1, [.add(Names.votes, 1)]) }
+        try await writer.sync()
+        let reader = Replica(actor: Names.ben, transport: LocalTransport(server: server, authenticatedAs: Names.ben),
+                             pullPageSize: 1)
+        await reader.setPullPageBudget(2)
+        let report = try await reader.sync()
+        XCTAssertTrue(report.pullStalled, "two one-entry pages can't reach v5")
+        let cursor = await reader.cursor
+        XCTAssertEqual(cursor, 2)
+    }
+
+    func testRestoredReplicaPushesNothingUntilItsFirstPullReachesTheHead() async throws {
+        let ws = Workspace()
+        try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])
+        try await ws.asha.sync()
+        let stale = await ws.ben.persistentState()
+        let link = ControllableTransport(server: ws.server, identity: Names.ben)
+        guard let restored = Replica(actor: Names.ben, transport: link, restoring: stale) else {
+            return XCTFail("restore")
+        }
+        try await restored.write(Names.item1, [.add(Names.votes, 1)])
+        await link.setEmptyPages(true)
+        let stalled = try await restored.sync()
+        XCTAssertTrue(stalled.pullStalled)
+        let pushes = await link.pushCount
+        XCTAssertEqual(pushes, 0, "re-keying needs the whole log, so nothing was pushed")
+        await link.setEmptyPages(false)
+        let report = try await restored.sync()
+        XCTAssertEqual(report.committed, 1)
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(1))
+    }
+
     func testASyncAfterAFinishedSyncStartsFresh() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 1)])

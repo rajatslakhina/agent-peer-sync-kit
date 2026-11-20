@@ -97,12 +97,13 @@ public struct AgentToolSurface: Sendable {
         }
 
         guard !editShapes.isEmpty else { return nil }
-        let lines = offeredFields.map { entry in
+        var lines = offeredFields.map { entry in
             "- \(entry.field.rawValue): " + (entry.grant == .direct ? "applies immediately" : "held until a person accepts it")
         }
+        if policy.mayDelete { lines.append("- delete the record: send {\"delete\": true} as the only edit") }
         let description = """
         Edit one record in the shared workspace. Your edit syncs like any other device's: it is \
-        checked by the server and may be refused. Fields you may edit:
+        checked by the server and may be refused. You may:
         \(lines.joined(separator: "\n"))
         If an edit touches any field that is held for review, the whole edit is held.
         """

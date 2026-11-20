@@ -49,9 +49,17 @@ AgentPeerSync takes the opposite position: the agent gets **no back door**. It i
 
 ### Using it
 
-End to end, with the in-process transport from `AgentPeerSyncTesting` (swap in your own `SyncTransport` for a real server). `SampleWorkspace` and `Names` in that module define a ready-made `schema`, policies, actors and fields if you want to paste and run this:
+End to end, with the in-process transport from `AgentPeerSyncTesting` (swap in your own `SyncTransport` for a real server). The first block binds everything to the ready-made sample in that module, so this runs as pasted (inside an `async throws` context):
 
 ```swift
+import AgentPeerSync
+import AgentPeerSyncTesting
+
+let schema = SampleWorkspace.schema
+let (personPolicy, agentPolicy) = (SampleWorkspace.personPolicy, SampleWorkspace.agentPolicy)
+let (phone, agent) = (Names.asha, Names.agent)
+let (itemID, title, votes) = (Names.item1, Names.title, Names.votes)
+
 let log = CommitLog(schema: schema, policies: [phone: personPolicy, agent: agentPolicy])
 let phoneReplica = Replica(actor: phone, transport: LocalTransport(server: log, authenticatedAs: phone))
 let agentReplica = Replica(actor: agent, transport: LocalTransport(server: log, authenticatedAs: agent))
@@ -64,6 +72,7 @@ let shown = await phoneReplica.view().visible         // confirmed state + this 
 let surface = AgentToolSurface(schema: schema, policy: agentPolicy)
 let tool = surface.definition()?.json
 // …and route each `tool_use` input (a JSONValue) back through the same pipe as a phone edit.
+let toolUseInput = JSONValue.parse(#"{"record_id":"item-1","edits":[{"field":"summary","value":"Ship behind a flag"}]}"#) ?? .null
 switch await surface.submit(toolUseInput, to: agentReplica) {
 case .queued: try await agentReplica.sync()           // the server decides: commit, propose or reject
 case .refused(let error): print(error)                // never reached the outbox; tell the model why
@@ -85,7 +94,7 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 **Review decisions are mutations.** Accept/reject travels through the same outbox, keys and log, so a reviewer can approve offline and the decision is ordered and deduplicated like any edit. No actor can settle its own proposal.
 
-**Idempotency is a per-writer sequence, and rejections consume it.** The server keeps the last `outcomeRetention` outcomes per actor (default 1,024) and replays them for retries; older retries get `.retryExpired`, never a second application. Each kept outcome is stored with a 16-byte fingerprint of the body (two 64-bit FNV-1a hashes of its canonical JSON), never the body itself, so a caller can't grow the window's memory by sending huge refused edits. A retry with the same key and a different body is refused as `.idempotencyConflict`. Because a refusal still consumes its number, a client never has to resubmit a refused edit to make progress. *Rejected:* random UUID keys with an unbounded seen-set — a contiguous sequence also gives per-writer ordering and a bounded window for free.
+**Idempotency is a per-writer sequence, and rejections consume it.** The server keeps the last `outcomeRetention` outcomes per actor (default 1,024) and replays them for retries; older retries get `.retryExpired`, never a second application. Each kept outcome is stored with a 16-byte fingerprint of the body (two 64-bit FNV-1a hashes of its sorted-key JSON encoding), never the body itself, so a caller can't grow the window's memory by sending huge refused edits. A retry with the same key and a different body is refused as `.idempotencyConflict`. Because a refusal still consumes its number, a client never has to resubmit a refused edit to make progress. *Rejected:* random UUID keys with an unbounded seen-set — a contiguous sequence also gives per-writer ordering and a bounded window for free.
 
 **The optimistic overlay is honest about what it knows.** `visible` is confirmed state plus (a) edits the server committed at a version the replica hasn't pulled yet, so an acknowledged edit doesn't flicker out, and (b) unanswered edits — except ones the log already contains (`appliedThrough`), so an edit whose response was lost isn't counted twice after a pull. A failed push doesn't stop the pull, so pending edits still rebase onto fresh state during a write outage.
 
@@ -97,11 +106,11 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 ## What's tested
 
-73 XCTest tests, run on macOS and Linux in CI, plus a **mutation check**: `scripts/mutation-check.sh` re-introduces 39 specific bugs, one at a time (skip the idempotent replay, apply an accepted proposal without re-checking it, let a stale write through, offer the agent every field, drop the outbox overlay, stop coalescing concurrent syncs, apply an entry past a gap, make the convergence check always pass, …) and fails CI if any of them still passes the suite.
+76 XCTest tests, run on macOS and Linux in CI, plus a **mutation check**: `scripts/mutation-check.sh` re-introduces 43 specific bugs, one at a time (skip the idempotent replay, apply an accepted proposal without re-checking it, let a stale write through, offer the agent every field, drop the outbox overlay, stop coalescing concurrent syncs, apply an entry past a gap, make the convergence check always pass, …) and fails CI if any of them still passes the suite.
 
-- **Admission** (18): every rule above, including own-write-isn't-stale, scalar-counted text limits and proposal backpressure.
+- **Admission** (19): every rule above, including own-write-isn't-stale, scalar-counted text limits, proposal backpressure, and decoded policies and schemas being clamped like constructed ones.
 - **Commit log** (17): replay, key reuse, a stable fixed-size fingerprint (checked against a known value, and the stored outcome's layout checked to hold no body), gaps, sequence consumption, batch cut-off, spoofed authors, revocation, replay-window expiry, review permissions, re-check on accept, paging, compaction that keeps a tail.
-- **Replica** (15) and **persistence** (8): overlay, no-flicker, rebase-on-pull during a write outage, lost and duplicated responses, edits cut from an oversized batch, coalesced syncs (and a joiner whose edit missed the running push getting its own round), stalled pulls, relaunch from saved state, re-keying edits queued after restoring a stale save, key bump after a pull, bounded outbox, gap refusal and reporting.
+- **Replica** (17) and **persistence** (8): overlay, no-flicker, rebase-on-pull during a write outage, lost and duplicated responses, edits cut from an oversized batch, coalesced syncs (and a joiner whose edit missed the running push getting its own round), stalled pulls (gap, no progress, page budget), relaunch from saved state, re-keying edits queued after restoring a stale save (and pushing nothing until the first pull reaches the head), key bump after a pull, bounded outbox, gap refusal and reporting.
 - **Agent tool** (10): offered fields match the grant, no tool for an empty grant, strict decoding, the 2^53 and `Int64` edges, and every offered edit is admitted by the server.
 - **Convergence** (3): 36 seeded random schedules of offline edits, reviews, connectivity changes and transport faults across two phones and an agent (some with a tiny replay window and aggressive compaction). Each must end with every replica equal to the server, a fresh replica paging one entry at a time equal to the server, and (in the runs without compaction, where the whole log is still there to inspect) no mutation in the log twice and each actor's mutations in its own order. A companion test feeds a deliberately broken server to one replica and asserts that the same convergence check reports it (`converged == false`, with that replica's row marked).
 - **Scenario** (2): the exact script the demo app plays, checked beat by beat.
@@ -110,8 +119,8 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 - **The server here is a reference implementation in memory.** `CommitLog` shows the admission and replay rules; a production server would run the same rules inside a database transaction and persist the log, the per-actor sequences and the outcome window.
 - **Grants control writes, not reads.** Every replica, the agent's included, pulls the whole workspace: all records, all fields and every open proposal. Read scoping (per-actor projections of the snapshot and the log) is not implemented; a production server must filter what an agent can read.
-- **The library does no I/O.** `ReplicaState` is `Codable`; persisting it (and doing so *before* an edit can reach the network) is the host's job. A replica restored from a stale save pulls before its first push and re-keys anything queued since the restore past every key the log holds, so those edits survive. It can't see a key whose only outcome was a refusal, because refusals never enter the log: an edit that reuses one is refused as `.idempotencyConflict` (or deduplicated into the old refusal if identical) and is lost.
-- **The replay-window fingerprint is not cryptographic.** A collision could only replay an actor's own earlier outcome to that same actor.
+- **The library does no I/O.** `ReplicaState` is `Codable`; persisting it (and doing so *before* an edit can reach the network) is the host's job. A replica restored from a stale save pulls before its first push (and pushes nothing until that pull reaches the head) and re-keys anything queued since the restore past every key the log holds, so those edits survive. It can't see a key whose only outcome was a refusal, because refusals never enter the log: an edit that reuses one is refused as `.idempotencyConflict` (or deduplicated into the old refusal if identical) and is lost.
+- **The replay-window fingerprint is not cryptographic,** and it hashes JSONEncoder's output, which is stable on the toolchains CI runs but not promised across Foundation versions. A collision could only replay an actor's own earlier outcome to that same actor; a server that persists fingerprints should store an encoding version with them.
 - **The agent in the demo is scripted.** `ScriptedNotesAgent` returns fixed `tool_use` inputs, including two deliberate mistakes. No model is called; the point is the seam, which takes real tool-use input unchanged.
 - **Accepted proposals to `lastWriterWins` fields overwrite newer values.** That's what the policy says; make a field `rejectStale` if an approved agent edit must not land on top of a newer human one.
 - **Tombstones are never purged**, and compaction keeps the whole current state, so the log is bounded but the state grows with the data.
@@ -120,12 +129,12 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 ## Verification
 
-Run locally on this package: a clean `swift build --build-tests -Xswiftc -warnings-as-errors` with zero warnings, `swift test` with 73 tests passing, `xcodebuild build` of both products for a generic iOS Simulator with warnings as errors (Xcode 27.2), and `scripts/mutation-check.sh` catching all 39 mutants. The CI workflow runs the same on GitHub's Linux (swift 6.0) and macOS 15 (Xcode 16.4) runners; see the [Actions tab](https://github.com/rajatslakhina/agent-peer-sync-kit/actions) for the latest results.
+Run locally on this package: a clean `swift build --build-tests -Xswiftc -warnings-as-errors` with zero warnings, `swift test` with 76 tests passing, `xcodebuild build` of both products for a generic iOS Simulator with warnings as errors (Xcode 27.2), and `scripts/mutation-check.sh` catching all 43 mutants. The CI workflow runs the same on GitHub's Linux (swift 6.0) and macOS 15 (Xcode 16.4) runners; see the [Actions tab](https://github.com/rajatslakhina/agent-peer-sync-kit/actions) for the latest results.
 
 ## Install
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-peer-sync-kit.git", from: "2.0.0")
+.package(url: "https://github.com/rajatslakhina/agent-peer-sync-kit.git", from: "2.0.2")
 ```
 
 MIT licensed.

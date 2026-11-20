@@ -30,6 +30,8 @@ final class ToolSurfaceTests: XCTestCase {
     func testDeleteIsOfferedOnlyWithTheGrant() {
         let person = AgentToolSurface(schema: SampleWorkspace.schema, policy: SampleWorkspace.personPolicy)
         XCTAssertEqual(editFields(in: person.definition()), ["done", "notes", "summary", "title", "votes", "<delete>"])
+        XCTAssertTrue(person.definition()?.description.contains("- delete the record") ?? false)
+        XCTAssertFalse(agentSurface.definition()?.description.contains("delete") ?? true)
         let input = JSONValue.parse(#"{"record_id":"item-1","edits":[{"delete":true}]}"#) ?? .null
         XCTAssertEqual(try person.decode(input).ops, [.delete])
         XCTAssertThrowsError(try agentSurface.decode(input)) { XCTAssertEqual($0 as? ToolInputError, .deleteNotOffered) }

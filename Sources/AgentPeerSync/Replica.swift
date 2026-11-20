@@ -110,6 +110,9 @@ public actor Replica {
     private var restoredKeys: Set<MutationID> = []
     /// How many `sync()` calls joined a sync that was already running. Observed by tests.
     private(set) var joinedSyncs = 0
+    /// Pages one sync may pull before reporting `pullStalled`. Internal so tests can lower it.
+    var pullPageBudget = 10_000
+    func setPullPageBudget(_ pages: Int) { pullPageBudget = max(1, pages) }
 
     /// Batch and page sizes are clamped to `1...500`.
     public init(actor: ActorID, transport: any SyncTransport, pushBatchSize: Int = 50, pullPageSize: Int = 200) {
@@ -125,7 +128,8 @@ public actor Replica {
     public init?(actor: ActorID, transport: any SyncTransport, restoring state: ReplicaState,
                  pushBatchSize: Int = 50, pullPageSize: Int = 200) {
         let used = state.outbox.map(\.id) + state.committedAhead.map(\.mutation.id)
-        guard state.actor == actor, used.allSatisfy({ $0.actor == actor && $0.clientSeq < state.nextSeq }) else {
+        guard state.actor == actor, state.nextSeq >= 1,
+              used.allSatisfy({ $0.actor == actor && $0.clientSeq < state.nextSeq }) else {
             return nil
         }
         self.actor = actor
@@ -175,15 +179,15 @@ public actor Replica {
 
     /// Push, then pull to the server's head. Concurrent callers share one sync: a second call
     /// while one is running awaits the same work instead of pushing the same outbox twice.
-    @discardableResult
     ///
     /// A caller that joins a running sync and still has an edit of its own in the outbox when
     /// that sync ends (it was written after the running push had passed) gets one more sync,
     /// so `write(...); try await sync()` always attempts to send that write.
+    @discardableResult
     public func sync() async throws -> SyncReport {
         guard let running = inFlight else { return try await startOrJoin() }
         joinedSyncs += 1
-        let newestAtCall = nextSeq - 1 // nextSeq >= 1, so no underflow
+        let newestAtCall = nextSeq - 1 // nextSeq starts at 1, only grows, and restore requires >= 1
         let report = try await running.value
         guard outbox.contains(where: { $0.id.clientSeq <= newestAtCall }) else { return report }
         return try await startOrJoin()
@@ -209,6 +213,9 @@ public actor Replica {
         // The push error is still thrown, after the pull, so the caller knows to retry.
         if pullBeforeFirstPush {
             try await pullToHead(into: &report) // throws before anything is pushed
+            // Re-keying is only sound against the whole log. If the pull stopped short of the
+            // head, push nothing; the next sync pulls first again.
+            if report.pullStalled { return report }
             pullBeforeFirstPush = false
             rekeyEditsQueuedSinceRestore()
             restoredKeys = []
@@ -266,7 +273,7 @@ public actor Replica {
 
     private func pullToHead(into report: inout SyncReport) async throws {
         // Bounded so a misbehaving server can't keep a sync running forever.
-        for _ in 0..<10_000 {
+        for _ in 0..<pullPageBudget {
             let cursor = confirmed.version
             let response = try await transport.pull(after: cursor, limit: pullPageSize)
             switch response {
@@ -308,8 +315,9 @@ public actor Replica {
         let admitted = confirmed.appliedThrough[actor] ?? 0
         let fresh = outbox.indices.filter { !restoredKeys.contains(outbox[$0].id) }
         guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }
-        let highestRestored = restoredKeys.map(\.clientSeq).max() ?? 0
-        let start = max(admitted, highestRestored)
+        // Every restored key is below every fresh key, so if a fresh key is <= admitted,
+        // all restored keys are too: starting right after `admitted` collides with nothing.
+        let start = admitted
         // Bounded by the outbox cap, far from UInt64.max; checked anyway.
         guard start < UInt64.max - UInt64(fresh.count) else { return }
         var next = start + 1
@@ -327,7 +335,7 @@ public actor Replica {
 
     /// If the log already holds this actor's mutations up to some sequence number (for
     /// instance after a relaunch from an older save), never hand out those numbers again.
-    /// A partial guard: it can't help for keys the replica uses before its first pull.
+    /// Edits queued before that pull are handled by `rekeyEditsQueuedSinceRestore()`.
     private func bumpSequencePastAdmittedEdits() {
         let admitted = confirmed.appliedThrough[actor] ?? 0
         if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }

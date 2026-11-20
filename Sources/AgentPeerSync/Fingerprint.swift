@@ -6,8 +6,10 @@ import Foundation
 /// Two 64-bit FNV-1a hashes with different offset bases over the mutation's canonical JSON
 /// encoding (sorted keys). Not cryptographic: a collision could only make the server replay
 /// an actor's *own* earlier outcome to that same actor, which is the actor harming itself.
-/// Stable across processes and platforms (unlike `Hasher`, which is seeded per process),
-/// so a persistent server could keep these on disk.
+/// Stable across processes and across the toolchains CI runs (macOS and Linux; unlike
+/// `Hasher`, which is seeded per process). It depends on JSONEncoder's exact output, which
+/// Foundation does not promise across versions, so a server that persists fingerprints
+/// should store an encoding version with them, or hash its own canonical byte format.
 struct Fingerprint: Hashable, Sendable {
     let high: UInt64
     let low: UInt64

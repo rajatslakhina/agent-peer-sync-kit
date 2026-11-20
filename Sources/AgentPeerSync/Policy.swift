@@ -17,6 +17,7 @@ public enum FieldKind: Hashable, Sendable, Codable {
 }
 
 public struct Schema: Hashable, Sendable, Codable {
+    private enum CodingKeys: String, CodingKey { case fields, maxOpsPerMutation }
     public static let maxTextLimit = 65_536
     public static let maxOpsLimit = 64
 
@@ -33,6 +34,14 @@ public struct Schema: Hashable, Sendable, Codable {
         }
         self.maxOpsPerMutation = min(max(maxOpsPerMutation, 1), Self.maxOpsLimit)
     }
+
+    /// Decoding goes through the clamping initializer, so a stored schema can't carry
+    /// limits the initializer would refuse.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(fields: try container.decode([FieldName: FieldKind].self, forKey: .fields),
+                  maxOpsPerMutation: try container.decode(Int.self, forKey: .maxOpsPerMutation))
+    }
 }
 
 public enum ActorKind: String, Hashable, Sendable, Codable {
@@ -42,6 +51,9 @@ public enum ActorKind: String, Hashable, Sendable, Codable {
 
 /// What one actor may do. The server holds these; a client never sends its own.
 public struct ActorPolicy: Hashable, Sendable, Codable {
+    private enum CodingKeys: String, CodingKey {
+        case kind, directFields, reviewedFields, mayCreate, mayDelete, mayReview, maxOpenProposals
+    }
     public static let maxOpenProposalsLimit = 1_000
 
     public let kind: ActorKind
@@ -67,6 +79,18 @@ public struct ActorPolicy: Hashable, Sendable, Codable {
         self.mayDelete = mayDelete
         self.mayReview = mayReview
         self.maxOpenProposals = min(max(maxOpenProposals, 1), Self.maxOpenProposalsLimit)
+    }
+
+    /// Decoding goes through the clamping initializer (see `Schema.init(from:)`).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(kind: try c.decode(ActorKind.self, forKey: .kind),
+                  directFields: try c.decode(Set<FieldName>.self, forKey: .directFields),
+                  reviewedFields: try c.decode(Set<FieldName>.self, forKey: .reviewedFields),
+                  mayCreate: try c.decode(Bool.self, forKey: .mayCreate),
+                  mayDelete: try c.decode(Bool.self, forKey: .mayDelete),
+                  mayReview: try c.decode(Bool.self, forKey: .mayReview),
+                  maxOpenProposals: try c.decode(Int.self, forKey: .maxOpenProposals))
     }
 
     public enum Grant: Hashable, Sendable { case direct, reviewed }

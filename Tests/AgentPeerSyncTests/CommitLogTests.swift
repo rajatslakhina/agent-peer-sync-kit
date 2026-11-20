@@ -268,7 +268,6 @@ final class CommitLogTests: XCTestCase {
         }
         let retained = await log.retainedEntries().count
         XCTAssertEqual(retained, 1)
-        XCTAssertGreaterThan(retained, 0, "compaction keeps the newer half")
         // A cursor one entry behind is still served entries, not a snapshot.
         let head = await log.head
         guard case let .entries(page, _) = await log.pull(after: head - 1, limit: 10) else {
