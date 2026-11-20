@@ -17,16 +17,16 @@ public actor CommitLog {
     public struct Configuration: Hashable, Sendable {
         /// How many outcomes per actor are kept for idempotent replay. A retry older than
         /// the window gets `.retryExpired` instead of a second application.
-        public var outcomeRetention: Int
+        public var outcomeRetention: Int { didSet { outcomeRetention = min(max(outcomeRetention, 1), 100_000) } }
         /// Entries kept before the log compacts itself into a snapshot. Bounds memory; a
         /// replica whose cursor falls behind the compaction point is sent the snapshot.
-        public var maxRetainedEntries: Int
-        public var maxPullPage: Int
+        public var maxRetainedEntries: Int { didSet { maxRetainedEntries = min(max(maxRetainedEntries, 2), 1_000_000) } }
+        public var maxPullPage: Int { didSet { maxPullPage = min(max(maxPullPage, 1), 10_000) } }
         /// Mutations admitted per push. The rest of a larger batch is answered with
         /// `.batchTooLarge` without being looked at or consuming a sequence number.
-        public var maxPushBatch: Int
+        public var maxPushBatch: Int { didSet { maxPushBatch = min(max(maxPushBatch, 1), 1_000) } }
 
-        /// Values are clamped: retention to `1...100_000`, retained entries to
+        /// Values are clamped, here and when a property is set later: retention to `1...100_000`, retained entries to
         /// `2...1_000_000`, page size to `1...10_000`, push batch to `1...1_000`.
         public init(outcomeRetention: Int = 1_024, maxRetainedEntries: Int = 10_000, maxPullPage: Int = 500,
                     maxPushBatch: Int = 500) {

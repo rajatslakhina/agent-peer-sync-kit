@@ -66,11 +66,11 @@ let agentReplica = Replica(actor: agent, transport: LocalTransport(server: log, 
 
 try await phoneReplica.write(itemID, [.set(title, .text("Ship offline mode")), .add(votes, 1)])
 try await phoneReplica.sync()                         // push the outbox, pull the log, rebase
-let shown = await phoneReplica.view().visible         // confirmed state + this replica's pending edits
+print(await phoneReplica.view().visible.liveRecords)  // confirmed state + this replica's pending edits
 
 // The agent: send this in `tools` on a Messages API request…
 let surface = AgentToolSurface(schema: schema, policy: agentPolicy)
-let tool = surface.definition()?.json
+print(surface.definition()?.json.jsonString() ?? "no tool")
 // …and route each `tool_use` input (a JSONValue) back through the same pipe as a phone edit.
 let toolUseInput = JSONValue.parse(#"{"record_id":"item-1","edits":[{"field":"summary","value":"Ship behind a flag"}]}"#) ?? .null
 switch await surface.submit(toolUseInput, to: agentReplica) {
@@ -106,20 +106,20 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 ## What's tested
 
-76 XCTest tests, run on macOS and Linux in CI, plus a **mutation check**: `scripts/mutation-check.sh` re-introduces 43 specific bugs, one at a time (skip the idempotent replay, apply an accepted proposal without re-checking it, let a stale write through, offer the agent every field, drop the outbox overlay, stop coalescing concurrent syncs, apply an entry past a gap, make the convergence check always pass, …) and fails CI if any of them still passes the suite.
+79 XCTest tests, run on macOS and Linux in CI, plus a **mutation check**: `scripts/mutation-check.sh` re-introduces 46 specific bugs, one at a time (skip the idempotent replay, apply an accepted proposal without re-checking it, let a stale write through, offer the agent every field, drop the outbox overlay, stop coalescing concurrent syncs, apply an entry past a gap, make the convergence check always pass, …) and fails CI if any of them still passes the suite.
 
 - **Admission** (19): every rule above, including own-write-isn't-stale, scalar-counted text limits, proposal backpressure, and decoded policies and schemas being clamped like constructed ones.
-- **Commit log** (17): replay, key reuse, a stable fixed-size fingerprint (checked against a known value, and the stored outcome's layout checked to hold no body), gaps, sequence consumption, batch cut-off, spoofed authors, revocation, replay-window expiry, review permissions, re-check on accept, paging, compaction that keeps a tail.
-- **Replica** (17) and **persistence** (8): overlay, no-flicker, rebase-on-pull during a write outage, lost and duplicated responses, edits cut from an oversized batch, coalesced syncs (and a joiner whose edit missed the running push getting its own round), stalled pulls (gap, no progress, page budget), relaunch from saved state, re-keying edits queued after restoring a stale save (and pushing nothing until the first pull reaches the head), key bump after a pull, bounded outbox, gap refusal and reporting.
+- **Commit log** (18): replay, key reuse, a stable fixed-size fingerprint (checked against a known value, and the stored outcome's layout checked to hold no body), gaps, sequence consumption, batch cut-off, spoofed authors, configuration clamped even when set after init, revocation, replay-window expiry, review permissions, re-check on accept, paging, compaction that keeps a tail.
+- **Replica** (17) and **persistence** (10): overlay, no-flicker, rebase-on-pull during a write outage, lost and duplicated responses, edits cut from an oversized batch, coalesced syncs (and a joiner whose edit missed the running push getting its own round), stalled pulls (gap, no progress, page budget), relaunch from saved state, re-keying edits queued after restoring a stale save (and pushing nothing until the first pull reaches the head, showing those edits meanwhile, and keeping that boundary across a second relaunch), key bump after a pull, bounded outbox, gap refusal and reporting.
 - **Agent tool** (10): offered fields match the grant, no tool for an empty grant, strict decoding, the 2^53 and `Int64` edges, and every offered edit is admitted by the server.
-- **Convergence** (3): 36 seeded random schedules of offline edits, reviews, connectivity changes and transport faults across two phones and an agent (some with a tiny replay window and aggressive compaction). Each must end with every replica equal to the server, a fresh replica paging one entry at a time equal to the server, and (in the runs without compaction, where the whole log is still there to inspect) no mutation in the log twice and each actor's mutations in its own order. A companion test feeds a deliberately broken server to one replica and asserts that the same convergence check reports it (`converged == false`, with that replica's row marked).
+- **Convergence** (3): 36 seeded random schedules of offline edits, reviews, connectivity changes, transport faults and app relaunches from saved (often stale) state across two phones and an agent (some with a tiny replay window and aggressive compaction). Each must end with every replica equal to the server, a fresh replica paging one entry at a time equal to the server, and (in the runs without compaction, where the whole log is still there to inspect) no mutation in the log twice and each actor's mutations in its own order. A companion test feeds a deliberately broken server to one replica and asserts that the same convergence check reports it (`converged == false`, with that replica's row marked).
 - **Scenario** (2): the exact script the demo app plays, checked beat by beat.
 
 ## Honest limits
 
 - **The server here is a reference implementation in memory.** `CommitLog` shows the admission and replay rules; a production server would run the same rules inside a database transaction and persist the log, the per-actor sequences and the outcome window.
 - **Grants control writes, not reads.** Every replica, the agent's included, pulls the whole workspace: all records, all fields and every open proposal. Read scoping (per-actor projections of the snapshot and the log) is not implemented; a production server must filter what an agent can read.
-- **The library does no I/O.** `ReplicaState` is `Codable`; persisting it (and doing so *before* an edit can reach the network) is the host's job. A replica restored from a stale save pulls before its first push (and pushes nothing until that pull reaches the head) and re-keys anything queued since the restore past every key the log holds, so those edits survive. It can't see a key whose only outcome was a refusal, because refusals never enter the log: an edit that reuses one is refused as `.idempotencyConflict` (or deduplicated into the old refusal if identical) and is lost.
+- **The library does no I/O.** `ReplicaState` is `Codable`; persisting it (and doing so *before* an edit can reach the network) is the host's job. A replica restored from a stale save pulls before its first push (and pushes nothing until that pull reaches the head) and re-keys anything queued since the restore past every key the log holds, so those edits survive; the boundary between restored and fresh keys is saved too, so this holds across a second relaunch before that pull. It can't see a key whose only outcome was a refusal, because refusals never enter the log: an edit that reuses one is refused as `.idempotencyConflict` (or deduplicated into the old refusal if identical) and is lost.
 - **The replay-window fingerprint is not cryptographic,** and it hashes JSONEncoder's output, which is stable on the toolchains CI runs but not promised across Foundation versions. A collision could only replay an actor's own earlier outcome to that same actor; a server that persists fingerprints should store an encoding version with them.
 - **The agent in the demo is scripted.** `ScriptedNotesAgent` returns fixed `tool_use` inputs, including two deliberate mistakes. No model is called; the point is the seam, which takes real tool-use input unchanged.
 - **Accepted proposals to `lastWriterWins` fields overwrite newer values.** That's what the policy says; make a field `rejectStale` if an approved agent edit must not land on top of a newer human one.
@@ -129,12 +129,12 @@ A production `SyncTransport` (say, over `URLSession`) has three duties: authenti
 
 ## Verification
 
-Run locally on this package: a clean `swift build --build-tests -Xswiftc -warnings-as-errors` with zero warnings, `swift test` with 76 tests passing, `xcodebuild build` of both products for a generic iOS Simulator with warnings as errors (Xcode 27.2), and `scripts/mutation-check.sh` catching all 43 mutants. The CI workflow runs the same on GitHub's Linux (swift 6.0) and macOS 15 (Xcode 16.4) runners; see the [Actions tab](https://github.com/rajatslakhina/agent-peer-sync-kit/actions) for the latest results.
+Run locally on this package: a clean `swift build --build-tests -Xswiftc -warnings-as-errors` with zero warnings, `swift test` with 79 tests passing, `xcodebuild build` of both products for a generic iOS Simulator with warnings as errors (Xcode 27.2), and `scripts/mutation-check.sh` catching all 46 mutants. The CI workflow runs the same on GitHub's Linux (swift 6.0) and macOS 15 (Xcode 16.4) runners; see the [Actions tab](https://github.com/rajatslakhina/agent-peer-sync-kit/actions) for the latest results.
 
 ## Install
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/agent-peer-sync-kit.git", from: "2.0.2")
+.package(url: "https://github.com/rajatslakhina/agent-peer-sync-kit.git", from: "2.0.3")
 ```
 
 MIT licensed.

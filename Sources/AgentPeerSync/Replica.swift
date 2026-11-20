@@ -33,6 +33,11 @@ public struct ReplicaState: Hashable, Sendable, Codable {
     public let nextSeq: UInt64
     public let outbox: [Mutation]
     public let committedAhead: [CommittedEdit]
+    /// Set while a restored replica hasn't yet completed a pull to the head: outbox keys at
+    /// or above it were allocated after a restore and have never been sent, so they may
+    /// collide with keys the log holds. Saved and restored, so the boundary survives a
+    /// second relaunch before that pull. Absent in states saved by a fully synced replica.
+    public internal(set) var freshFrom: UInt64?
 }
 
 /// An edit the server committed at `seq` that the replica hasn't pulled yet.
@@ -104,10 +109,10 @@ public actor Replica {
     private var inFlight: Task<SyncReport, any Error>?
     /// Set by `init(restoring:)`: the first sync pulls before it pushes, so keys the log
     /// already holds are skipped before anything queued since the save goes out.
-    private var pullBeforeFirstPush = false
-    /// Keys that came from the saved outbox. They may already be on the server (a lost
-    /// response), so they are never re-keyed.
-    private var restoredKeys: Set<MutationID> = []
+    /// Non-nil from `init(restoring:)` until a pull reaches the head: outbox keys at or
+    /// above it have never been sent (see `ReplicaState.freshFrom`); keys below it came from
+    /// the saved outbox and may already be on the server, so they are never re-keyed.
+    private var freshFrom: UInt64?
     /// How many `sync()` calls joined a sync that was already running. Observed by tests.
     private(set) var joinedSyncs = 0
     /// Pages one sync may pull before reporting `pullStalled`. Internal so tests can lower it.
@@ -140,16 +145,18 @@ public actor Replica {
         nextSeq = state.nextSeq
         outbox = state.outbox
         committedAhead = state.committedAhead
-        pullBeforeFirstPush = true
-        restoredKeys = Set(state.outbox.map(\.id))
         // Same rule as `bumpSequencePastAdmittedEdits()`, inlined: init is nonisolated.
+        var next = state.nextSeq
         let admitted = state.confirmed.appliedThrough[actor] ?? 0
-        if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }
+        if admitted < UInt64.max, next <= admitted { next = admitted + 1 }
+        nextSeq = next
+        // Keep an earlier restore's boundary if that restore never completed its first pull.
+        freshFrom = state.freshFrom.map { min($0, next) } ?? next
     }
 
     public func persistentState() -> ReplicaState {
         ReplicaState(actor: actor, confirmed: confirmed, nextSeq: nextSeq, outbox: outbox,
-                     committedAhead: committedAhead)
+                     committedAhead: committedAhead, freshFrom: freshFrom)
     }
 
     // MARK: Local edits
@@ -211,14 +218,13 @@ public actor Replica {
         // A failed push doesn't stop the pull: with writes refused but reads working (a
         // partial outage), the replica still rebases its pending edits onto fresh state.
         // The push error is still thrown, after the pull, so the caller knows to retry.
-        if pullBeforeFirstPush {
+        if freshFrom != nil {
             try await pullToHead(into: &report) // throws before anything is pushed
             // Re-keying is only sound against the whole log. If the pull stopped short of the
             // head, push nothing; the next sync pulls first again.
             if report.pullStalled { return report }
-            pullBeforeFirstPush = false
             rekeyEditsQueuedSinceRestore()
-            restoredKeys = []
+            freshFrom = nil
         }
         var pushFailure: (any Error)?
         do {
@@ -313,7 +319,8 @@ public actor Replica {
     /// order, fresh keys after both the log's and the saved outbox's highest key.
     private func rekeyEditsQueuedSinceRestore() {
         let admitted = confirmed.appliedThrough[actor] ?? 0
-        let fresh = outbox.indices.filter { !restoredKeys.contains(outbox[$0].id) }
+        guard let boundary = freshFrom else { return }
+        let fresh = outbox.indices.filter { outbox[$0].id.clientSeq >= boundary }
         guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }
         // Every restored key is below every fresh key, so if a fresh key is <= admitted,
         // all restored keys are too: starting right after `admitted` collides with nothing.
@@ -352,7 +359,12 @@ public actor Replica {
         // twice; it stays in the outbox until a push learns its outcome. Overlay writes are
         // stamped with the pseudo-version `UInt64.max`; read only field values from `visible`.
         let admitted = confirmed.appliedThrough[actor] ?? 0
-        let unanswered = outbox.filter { $0.id.clientSeq > admitted }
+        // Until a restored replica has pulled to the head, its fresh keys may equal keys the
+        // log holds for *other*, older edits, so they always count as unanswered.
+        let unanswered = outbox.filter { mutation in
+            if let boundary = freshFrom, mutation.id.clientSeq >= boundary { return true }
+            return mutation.id.clientSeq > admitted
+        }
         let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation) + unanswered
         for mutation in overlay {
             guard case let .write(record, ops, _) = mutation.body else { continue }

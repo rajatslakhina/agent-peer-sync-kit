@@ -121,6 +121,23 @@ final class CommitLogTests: XCTestCase {
         XCTAssertEqual(votes, .count(3))
     }
 
+    func testConfigurationIsClampedWhenSetAfterInit() async {
+        var configuration = CommitLog.Configuration()
+        configuration.outcomeRetention = -1
+        configuration.maxPullPage = 0
+        configuration.maxPushBatch = 0
+        configuration.maxRetainedEntries = -5
+        XCTAssertEqual(configuration.outcomeRetention, 1)
+        XCTAssertEqual(configuration.maxPullPage, 1)
+        XCTAssertEqual(configuration.maxPushBatch, 1)
+        XCTAssertEqual(configuration.maxRetainedEntries, 2)
+        let log = makeLog(configuration)
+        let first = await push(log, write(Names.asha, 1, Names.item1, [.add(Names.votes, 1)]))
+        XCTAssertEqual(first, .committed(seq: 1))
+        let retry = await push(log, write(Names.asha, 1, Names.item1, [.add(Names.votes, 1)]))
+        XCTAssertEqual(retry, .committed(seq: 1), "a window of one still replays the latest outcome")
+    }
+
     func testOversizedBatchIsCutWithoutConsumingSequenceNumbers() async {
         let log = makeLog(.init(maxPushBatch: 2))
         let batch = (1...3).map { write(Names.asha, UInt64($0), Names.item1, [.add(Names.votes, 1)]) }

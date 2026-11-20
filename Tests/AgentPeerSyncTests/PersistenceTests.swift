@@ -76,6 +76,52 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(notes, .text("second"))
     }
 
+    func testAFreshEditSurvivesASecondRelaunchBeforeTheFirstPull() async throws {
+        let ws = Workspace()
+        let stale = await ws.ben.persistentState()
+        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("first"))])
+        try await ws.ben.sync()
+
+        // Relaunch #1 from the stale save, offline: the edit gets key ben#1 and can't sync.
+        await ws.benLink.setOnline(false)
+        guard let first = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else { return XCTFail("restore") }
+        let queued = try await first.write(Names.item1, [.set(Names.notes, .text("second"))])
+        XCTAssertEqual(queued.clientSeq, 1)
+        _ = try? await first.sync()
+        let saved = try JSONDecoder().decode(ReplicaState.self, from: JSONEncoder().encode(await first.persistentState()))
+        XCTAssertNotNil(saved.freshFrom, "the unverified boundary is saved")
+
+        // Relaunch #2, online: ben#1 is still recognised as fresh and re-keyed.
+        await ws.benLink.setOnline(true)
+        guard let second = Replica(actor: Names.ben, transport: ws.benLink, restoring: saved) else { return XCTFail("restore") }
+        try await second.sync()
+        let rejections = await second.view().rejections
+        XCTAssertTrue(rejections.isEmpty)
+        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
+        XCTAssertEqual(notes, .text("second"))
+        let after = await second.persistentState()
+        XCTAssertNil(after.freshFrom, "cleared once a pull reached the head")
+    }
+
+    func testRestoredReplicaShowsItsFreshEditEvenWhileTheFirstPullIsIncomplete() async throws {
+        let ws = Workspace()
+        let stale = await ws.ben.persistentState()
+        for text in ["a", "b", "c"] {
+            try await ws.ben.write(Names.item1, [.set(Names.notes, .text(text))])
+            try await ws.ben.sync()
+        }
+        guard let restored = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale, pullPageSize: 1) else {
+            return XCTFail("restore")
+        }
+        await restored.setPullPageBudget(1)
+        try await restored.write(Names.item1, [.set(Names.notes, .text("mine"))]) // key ben#1, like "a"
+        let report = try await restored.sync()
+        XCTAssertTrue(report.pullStalled)
+        let view = await restored.view()
+        XCTAssertEqual(view.visible.records[Names.item1]?[Names.notes], .text("mine"))
+        XCTAssertEqual(view.recordsWithLocalEdits, [Names.item1])
+    }
+
     func testRestoredOutboxKeepsItsKeysWhileNewEditsAreReKeyed() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 0)])

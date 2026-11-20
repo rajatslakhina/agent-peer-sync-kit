@@ -39,7 +39,7 @@ final class ConvergenceTests: XCTestCase {
     /// Random offline edits, reviews, connectivity changes and transport faults across two
     /// phones and an agent; then everyone reconnects. Checks the properties the README claims.
     struct Stats {
-        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0
+        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0, relaunches = 0
     }
 
     @discardableResult
@@ -48,14 +48,17 @@ final class ConvergenceTests: XCTestCase {
         var rng = SeededGenerator(seed: seed)
         let ws = Workspace(configuration: configuration)
         let links = [ws.ashaLink, ws.benLink, ws.agentLink]
-        let replicas = ws.replicas
+        var replicas = ws.replicas
+        // The last state each replica's "app" saved; a relaunch restores from it, so it is
+        // often older than the replica it replaces (a stale save).
+        var saved: [ReplicaState?] = Array(repeating: nil, count: replicas.count)
 
         for _ in 0..<steps {
             let index = Int.random(in: 0..<replicas.count, using: &rng)
             guard replicas.indices.contains(index), links.indices.contains(index) else { continue }
             let replica = replicas[index]
             let link = links[index]
-            switch Int.random(in: 0..<10, using: &rng) {
+            switch Int.random(in: 0..<12, using: &rng) {
             case 0..<5:
                 let record = records[Int.random(in: 0..<records.count, using: &rng)]
                 try await replica.write(record, randomEdit(for: replica.actor, using: &rng))
@@ -67,6 +70,20 @@ final class ConvergenceTests: XCTestCase {
                 await link.setOnline(!(await link.isOnline))
             case 7:
                 await link.injectOnNextPush(faults[Int.random(in: 0..<faults.count, using: &rng)])
+            case 10:
+                saved[index] = await replica.persistentState()
+            case 11:
+                // Relaunch: JSON round-trip of the last save (or of the current state).
+                let current = await replica.persistentState()
+                let state = saved[index] ?? current
+                let data = try JSONEncoder().encode(state)
+                let decoded = try JSONDecoder().decode(ReplicaState.self, from: data)
+                guard let restored = Replica(actor: replica.actor, transport: link, restoring: decoded) else {
+                    XCTFail("seed \(seed): a saved state was refused on restore")
+                    continue
+                }
+                replicas[index] = restored
+                stats.relaunches += 1
             default:
                 if let report = try? await replica.sync() {
                     stats.committed += report.committed
@@ -88,7 +105,7 @@ final class ConvergenceTests: XCTestCase {
         }
         for replica in replicas { _ = try await replica.sync() }
 
-        let check = await ws.convergence()
+        let check = await Workspace.convergence(of: replicas, with: ws.server)
         XCTAssertTrue(check.converged, "seed \(seed): \(check.rows)")
 
         // A replica built from nothing, paging one entry at a time, reaches the same state.
@@ -131,12 +148,14 @@ final class ConvergenceTests: XCTestCase {
             total.proposed += stats.proposed
             total.resolved += stats.resolved
             total.rejected += stats.rejected
+            total.relaunches += stats.relaunches
         }
         // Guard against a schedule that silently stops exercising the interesting paths.
         XCTAssertGreaterThan(total.committed, 500)
         XCTAssertGreaterThan(total.proposed, 25)
         XCTAssertGreaterThan(total.resolved, 10)
         XCTAssertGreaterThan(total.rejected, 25)
+        XCTAssertGreaterThan(total.relaunches, 50, "replicas really were relaunched from saved state")
     }
 
     func testRandomSchedulesConvergeThroughCompactionAndASmallReplayWindow() async throws {

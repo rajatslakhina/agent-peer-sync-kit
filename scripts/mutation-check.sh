@@ -25,7 +25,7 @@ MUTANTS=(
   '$S/State.swift|        appliedThrough[author.actor] = max(appliedThrough[author.actor] ?? 0, author.clientSeq)|        _ = author|the reducer records which edits the log already holds'
   '$S/Replica.swift|            if seq > confirmed.version { committedAhead.append(CommittedEdit(mutation: mutation, seq: seq)) }|            _ = seq|an acknowledged edit stays visible until it is pulled'
   '$S/Replica.swift|        committedAhead.removeAll { $0.seq <= confirmed.version }|        committedAhead.removeAll { _ in false }|pulled commits leave the overlay so newer remote values show'
-  '$S/Replica.swift|        let unanswered = outbox.filter { $0.id.clientSeq > admitted }|        let unanswered = outbox|an edit whose response was lost is not counted twice'
+  '$S/Replica.swift|            return mutation.id.clientSeq > admitted|            return true|an edit whose response was lost is not counted twice'
   '$S/Replica.swift|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation) + unanswered|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation)|local edits are visible before they sync'
   '$S/Replica.swift|        guard let running = inFlight else { return try await startOrJoin() }|        guard let running = Optional<Task<SyncReport, any Error>>.none else { return try await startOrJoin() }|concurrent sync calls join the running sync'
   '$S/Replica.swift|        } catch {\n            pushFailure = error\n        }|        } catch {\n            throw error\n        }|a failed push does not stop the pull'
@@ -46,12 +46,15 @@ MUTANTS=(
   '$S/Replica.swift|        guard outbox.contains(where: { $0.id.clientSeq <= newestAtCall }) else { return report }|        if true { return report }|a joiner whose edit missed the running push gets another round'
   '$S/Replica.swift|                if confirmed.version == cursor {\n                    report.pullStalled = true|                if confirmed.version == cursor {\n                    report.pullStalled = false|a page that makes no progress is reported'
   '$S/Replica.swift|        guard fresh.contains(where: { outbox[$0].id.clientSeq <= admitted }) else { return }|        guard false else { return }|edits queued after a restore are re-keyed past the log'"'"'s keys'
-  '$S/Replica.swift|        if pullBeforeFirstPush {\n            try await pullToHead|        if false, pullBeforeFirstPush {\n            try await pullToHead|a restored replica pulls before its first push'
+  '$S/Replica.swift|        if freshFrom != nil {\n            try await pullToHead|        if false, freshFrom != nil {\n            try await pullToHead|a restored replica pulls before its first push'
   '$S/CommitLog.swift|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n|        let fingerprint: Fingerprint\n        let outcome: MutationOutcome\n        let body: Mutation? = nil\n|the replay window never holds the body'
-  '$S/Replica.swift|            if report.pullStalled { return report }\n            pullBeforeFirstPush = false|            pullBeforeFirstPush = false|a restored replica pushes nothing until its first pull reaches the head'
+  '$S/Replica.swift|            if report.pullStalled { return report }\n            rekeyEditsQueuedSinceRestore()|            rekeyEditsQueuedSinceRestore()|a restored replica pushes nothing until its first pull reaches the head'
   '$S/Replica.swift|state.actor == actor, state.nextSeq >= 1,|state.actor == actor,|a restored state with nextSeq 0 is refused'
   '$S/Replica.swift|        report.pullStalled = true // page budget exhausted before reaching the head\n||running out of page budget is reported'
   '$S/AgentToolSurface.swift|        if policy.mayDelete { lines.append(|        if false, policy.mayDelete { lines.append(|the tool description mentions delete when it is offered'
+  '$S/Replica.swift|            if let boundary = freshFrom, mutation.id.clientSeq >= boundary { return true }\n||a restored replica shows its fresh edits before its first full pull'
+  '$S/Replica.swift|        freshFrom = state.freshFrom.map { min($0, next) } ?? next|        freshFrom = next|the fresh-key boundary survives a second relaunch'
+  '$S/CommitLog.swift|        public var outcomeRetention: Int { didSet { outcomeRetention = min(max(outcomeRetention, 1), 100_000) } }|        public var outcomeRetention: Int|configuration set after init is clamped'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then
@@ -61,7 +64,9 @@ echo "baseline: unmutated suite passes"
 survived=0; caught=0
 BACKUP=$(mktemp -d); CURRENT=""
 trap '[ -n "$CURRENT" ] && cp "$BACKUP/orig" "$CURRENT"; rm -rf "$BACKUP"' EXIT
+skip=${SKIP:-0}; index=0  # SKIP=n resumes after n mutants on an unchanged tree
 for entry in "${MUTANTS[@]}"; do
+  index=$((index + 1)); [ "$index" -le "$skip" ] && continue
   entry=${entry//\$S/$S}
   IFS='|' read -r file from to claim <<< "$entry"
   cp "$file" "$BACKUP/orig"; CURRENT="$file"
