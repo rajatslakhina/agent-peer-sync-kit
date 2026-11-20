@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Each mutant re-introduces a specific bug that the README says the design prevents.
+# A mutant "survives" if the test suite still passes with it applied, which means the
+# claim is untested. The script fails if any mutant survives, if a mutant doesn't
+# compile, if a pattern isn't found exactly once, or if the unmutated suite fails.
+# Runs on macOS and Linux (the library has no Apple-only code).
+set -u
+cd "$(dirname "$0")/.."
+S=Sources/AgentPeerSync
+# file | exact text to replace (must occur exactly once; \n is a newline) | replacement | the claim it breaks
+MUTANTS=(
+  '$S/CommitLog.swift|        if seq <= last {|        if false, seq <= last {|a retry replays the stored outcome instead of being re-applied'
+  '$S/CommitLog.swift|            return stored.mutation == mutation ? stored.outcome : .rejected(.idempotencyConflict)|            return stored.outcome|a reused idempotency key with a different body is refused'
+  '$S/CommitLog.swift|        if seq > retention { stored.removeValue(forKey: seq - retention) }|        _ = retention|stored outcomes are bounded by the replay window'
+  '$S/CommitLog.swift|        lastSeq[caller] = seq|        if case .rejected = outcome {} else { lastSeq[caller] = seq }|a rejection consumes its sequence number'
+  '$S/CommitLog.swift|        guard mutation.id.actor == caller else { return .rejected(.actorMismatch) }|        _ = caller|a caller cannot submit another actor'"'"'s mutation'
+  '$S/CommitLog.swift|                resolution = recheck(proposal)|                resolution = .applied|acceptance is re-checked against the current state and grant'
+  '$S/CommitLog.swift|            guard proposal.author != author else { return .rejected(.selfReview) }|            _ = proposal.author|an actor cannot accept its own proposal'
+  '$S/CommitLog.swift|        if entries.count > configuration.maxRetainedEntries { compact() }|        _ = configuration.maxRetainedEntries|the log compacts itself to bound memory'
+  '$S/Policy.swift|               let write = existing?.writes[name], write.version > baseVersion, write.actor != author {|               let write = existing?.writes[name], false, write.version > baseVersion, write.actor != author {|a stale write to a rejectStale field is refused'
+  '$S/Policy.swift|               let write = existing?.writes[name], write.version > baseVersion, write.actor != author {|               let write = existing?.writes[name], write.version > baseVersion {|an author'"'"'s own earlier write is not a conflict'
+  '$S/Policy.swift|        guard open < policy.maxOpenProposals else {|        guard true else {|open proposals per author are bounded'
+  '$S/Policy.swift|            case .reviewed?: needsReview = true|            case .reviewed?: break|a reviewed field turns the whole write into a proposal'
+  '$S/State.swift|        return rhs > 0 ? .max : .min|        return sum|counters saturate instead of wrapping'
+  '$S/State.swift|        appliedThrough[author.actor] = max(appliedThrough[author.actor] ?? 0, author.clientSeq)|        _ = author|the reducer records which edits the log already holds'
+  '$S/Replica.swift|            if seq > confirmed.version { committedAhead.append(CommittedEdit(mutation: mutation, seq: seq)) }|            _ = seq|an acknowledged edit stays visible until it is pulled'
+  '$S/Replica.swift|        committedAhead.removeAll { $0.seq <= confirmed.version }|        committedAhead.removeAll { _ in false }|pulled commits leave the overlay so newer remote values show'
+  '$S/Replica.swift|        let unanswered = outbox.filter { $0.id.clientSeq > admitted }|        let unanswered = outbox|an edit whose response was lost is not counted twice'
+  '$S/Replica.swift|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation) + unanswered|        let overlay = committedAhead.sorted { $0.seq < $1.seq }.map(\.mutation)|local edits are visible before they sync'
+  '$S/Replica.swift|        if let running = inFlight { return try await running.value }|        _ = inFlight|concurrent sync calls share one push'
+  '$S/Replica.swift|        } catch {\n            pushFailure = error\n        }|        } catch {\n            throw error\n        }|a failed push does not stop the pull'
+  '$S/AgentToolSurface.swift|            guard let kind = schema.fields[field], let grant = policy.grant(for: field) else { return nil }|            guard let kind = schema.fields[field], let grant = Optional(policy.grant(for: field) ?? .direct) else { return nil }|the tool offers only the fields the actor may write'
+  '$S/AgentToolSurface.swift|                guard case let .number(number)? = body["add"], let delta = Int64(exactly: number) else {|                guard case let .number(number)? = body["add"], let delta = Optional(Int64(number)) else {|a counter delta that does not fit Int64 is refused, not trapped'
+  '$S/AgentToolSurface.swift|                try Self.requireOnly(["field", "value"], in: body)\n                guard case let .string(text)?|                guard case let .string(text)?|unexpected keys in a text edit are refused'
+  '$S/State.swift|        guard version < UInt64.max, entry.seq == version + 1 else { return false }|        guard version < UInt64.max, entry.seq > version else { return false }|a replica never applies an entry past a gap'
+  '$S/Replica.swift|        guard outbox.count + committedAhead.count < Self.maxPendingEdits else {|        guard true else {|pending edits are bounded'
+  '$S/Replica.swift|used.allSatisfy({ $0.actor == actor && $0.clientSeq < state.nextSeq })|used.allSatisfy({ $0.actor == actor })|a restore that would reuse idempotency keys is refused'
+)
+if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
+if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then
+  echo "BASELINE FAILED: the unmutated suite must pass before mutants mean anything"; exit 2
+fi
+echo "baseline: unmutated suite passes"
+survived=0; caught=0
+BACKUP=$(mktemp -d); CURRENT=""
+trap '[ -n "$CURRENT" ] && cp "$BACKUP/orig" "$CURRENT"; rm -rf "$BACKUP"' EXIT
+for entry in "${MUTANTS[@]}"; do
+  entry=${entry//\$S/$S}
+  IFS='|' read -r file from to claim <<< "$entry"
+  cp "$file" "$BACKUP/orig"; CURRENT="$file"
+  count=$(FROM="$from" perl -0777 -ne '($f=$ENV{FROM}) =~ s/\\n/\n/g; $c = () = /\Q$f\E/g; print $c' "$file")
+  if [ "$count" != "1" ]; then echo "SETUP ERROR: pattern occurs $count times in $file: $claim"; exit 2; fi
+  FROM="$from" TO="$to" perl -0777 -pi -e 'BEGIN { ($f = $ENV{FROM}) =~ s/\\n/\n/g; ($t = $ENV{TO}) =~ s/\\n/\n/g } s/\Q$f\E/$t/' "$file"
+  if ! swift build --build-tests -q >/dev/null 2>&1; then
+    echo "SETUP ERROR: mutant does not compile: $claim"; exit 2
+  fi
+  $LIMIT swift test --skip-build >/dev/null 2>&1; status=$?
+  if [ "$status" -eq 0 ]; then
+    echo "SURVIVED: $claim"; survived=$((survived + 1))
+  elif [ "$status" -eq 124 ] || [ "$status" -eq 142 ]; then
+    # A hang is not a catch: the suite must fail on an assertion, not on a timeout.
+    echo "TIMEOUT:  $claim"; survived=$((survived + 1))
+  else
+    echo "caught:   $claim"; caught=$((caught + 1))
+  fi
+  cp "$BACKUP/orig" "$file"; CURRENT=""
+done
+echo "mutants caught: $caught, survived or timed out: $survived"
+[ "$survived" -eq 0 ]
