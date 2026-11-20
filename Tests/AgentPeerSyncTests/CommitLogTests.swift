@@ -121,6 +121,27 @@ final class CommitLogTests: XCTestCase {
         XCTAssertEqual(votes, .count(3))
     }
 
+    func testOversizedBatchIsCutWithoutConsumingSequenceNumbers() async {
+        let log = makeLog(.init(maxPushBatch: 2))
+        let batch = (1...3).map { write(Names.asha, UInt64($0), Names.item1, [.add(Names.votes, 1)]) }
+        let outcomes = await log.push(batch, as: Names.asha).map(\.outcome)
+        XCTAssertEqual(outcomes, [.committed(seq: 1), .committed(seq: 2), .rejected(.batchTooLarge(limit: 2))])
+        // The cut mutation was never looked at: the same key is admitted next time.
+        let again = await push(log, batch[2])
+        XCTAssertEqual(again, .committed(seq: 3))
+    }
+
+    func testReplayWindowKeepsAStableFixedSizeFingerprint() {
+        // A known value, so a per-process seeded hash (like `Hasher`) would fail here.
+        let mutation = write(Names.asha, 1, Names.item1, [.add(Names.votes, 1)])
+        XCTAssertEqual(Fingerprint(mutation).hex, "8a32692bb50326605782e31149c66b1b")
+        let other = write(Names.asha, 1, Names.item1, [.add(Names.votes, 2)])
+        XCTAssertNotEqual(Fingerprint(mutation), Fingerprint(other))
+        // A huge body still costs 16 bytes in the window.
+        let huge = write(Names.asha, 1, Names.item1, [.set(Names.notes, .text(String(repeating: "x", count: 1_000_000)))])
+        XCTAssertEqual(MemoryLayout.size(ofValue: Fingerprint(huge)), 16)
+    }
+
     // MARK: Review
 
     /// item-1 created at v1, the agent proposes a new title at v2.
@@ -239,12 +260,20 @@ final class CommitLogTests: XCTestCase {
     func testLogCompactsItselfToBoundMemory() async {
         let log = makeLog(.init(maxRetainedEntries: 3))
         _ = await push(log, write(Names.asha, 1, Names.item1, [.add(Names.votes, 0)]))
-        for seq: UInt64 in 1...6 {
+        // The 4th entry crosses the limit of 3: everything but the newest maxRetainedEntries / 2 (= 1) is folded.
+        for seq: UInt64 in 1...3 {
             _ = await push(log, write(Names.ben, seq, Names.item1, [.add(Names.votes, 1)], base: 1))
         }
         let retained = await log.retainedEntries().count
-        XCTAssertLessThanOrEqual(retained, 3)
+        XCTAssertEqual(retained, 1)
+        XCTAssertGreaterThan(retained, 0, "compaction keeps the newer half")
+        // A cursor one entry behind is still served entries, not a snapshot.
+        let head = await log.head
+        guard case let .entries(page, _) = await log.pull(after: head - 1, limit: 10) else {
+            return XCTFail("a slightly-behind replica should get entries")
+        }
+        XCTAssertEqual(page.map(\.seq), [head])
         let votes = await votes(log)
-        XCTAssertEqual(votes, .count(6))
+        XCTAssertEqual(votes, .count(3))
     }
 }

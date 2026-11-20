@@ -18,7 +18,8 @@ public enum Names {
     public static let item3 = literal(RecordID("item-3"), "item-3")
 
     /// Provably non-nil: every literal above is 1–64 characters of `a–z 0–9 -`, which
-    /// `IdentifierRule` accepts, and `NamesTests` constructs each one. The precondition
+    /// `IdentifierRule` accepts, and `AdmissionTests.testSampleNamesAreValidLiterals`
+    /// constructs each one. The precondition
     /// documents that instead of hiding it behind a `!`.
     static func literal<T>(_ value: T?, _ text: String) -> T {
         guard let value else { preconditionFailure("\(text) is not a valid identifier literal") }
@@ -88,6 +89,11 @@ public final class Workspace: Sendable {
 
     /// Compares each replica's confirmed state with the server's, without syncing.
     public func convergence() async -> Convergence {
+        await Self.convergence(of: replicas, with: server)
+    }
+
+    /// The same check for any set of replicas against any log.
+    public static func convergence(of replicas: [Replica], with server: CommitLog) async -> Convergence {
         let truth = await server.snapshot()
         var rows: [Convergence.Row] = []
         for replica in replicas {

@@ -22,18 +22,25 @@ public actor CommitLog {
         /// replica whose cursor falls behind the compaction point is sent the snapshot.
         public var maxRetainedEntries: Int
         public var maxPullPage: Int
+        /// Mutations admitted per push. The rest of a larger batch is answered with
+        /// `.batchTooLarge` without being looked at or consuming a sequence number.
+        public var maxPushBatch: Int
 
         /// Values are clamped: retention to `1...100_000`, retained entries to
-        /// `1...1_000_000`, page size to `1...10_000`.
-        public init(outcomeRetention: Int = 1_024, maxRetainedEntries: Int = 10_000, maxPullPage: Int = 500) {
+        /// `2...1_000_000`, page size to `1...10_000`, push batch to `1...1_000`.
+        public init(outcomeRetention: Int = 1_024, maxRetainedEntries: Int = 10_000, maxPullPage: Int = 500,
+                    maxPushBatch: Int = 500) {
             self.outcomeRetention = min(max(outcomeRetention, 1), 100_000)
-            self.maxRetainedEntries = min(max(maxRetainedEntries, 1), 1_000_000)
+            self.maxRetainedEntries = min(max(maxRetainedEntries, 2), 1_000_000)
             self.maxPullPage = min(max(maxPullPage, 1), 10_000)
+            self.maxPushBatch = min(max(maxPushBatch, 1), 1_000)
         }
     }
 
+    /// What the replay window keeps per admitted sequence number: a fixed-size fingerprint
+    /// of the body (never the body itself, whose size the caller controls) and the outcome.
     private struct StoredOutcome {
-        let mutation: Mutation
+        let fingerprint: Fingerprint
         let outcome: MutationOutcome
     }
 
@@ -70,7 +77,12 @@ public actor CommitLog {
     /// Admits a batch from the authenticated `caller`, in order, and returns one result per
     /// mutation in the same order.
     public func push(_ batch: [Mutation], as caller: ActorID) -> [PushResult] {
-        batch.map { PushResult(id: $0.id, outcome: admit($0, caller: caller)) }
+        batch.enumerated().map { index, mutation in
+            guard index < configuration.maxPushBatch else {
+                return PushResult(id: mutation.id, outcome: .rejected(.batchTooLarge(limit: configuration.maxPushBatch)))
+            }
+            return PushResult(id: mutation.id, outcome: admit(mutation, caller: caller))
+        }
     }
 
     private func admit(_ mutation: Mutation, caller: ActorID) -> MutationOutcome {
@@ -84,7 +96,7 @@ public actor CommitLog {
             // A retry: replay what happened the first time instead of applying it again.
             // Checked before the policy, so a retry still learns the truth after a revocation.
             guard let stored = outcomes[caller]?[seq] else { return .rejected(.retryExpired) }
-            return stored.mutation == mutation ? stored.outcome : .rejected(.idempotencyConflict)
+            return stored.fingerprint == Fingerprint(mutation) ? stored.outcome : .rejected(.idempotencyConflict)
         }
         // An unknown or revoked actor gets no new sequence numbers.
         guard let policy = policies[caller] else { return .rejected(.unknownActor) }
@@ -96,7 +108,7 @@ public actor CommitLog {
         // never has to resubmit a refused edit to make progress past it.
         lastSeq[caller] = seq
         var stored = outcomes[caller] ?? [:]
-        stored[seq] = StoredOutcome(mutation: mutation, outcome: outcome)
+        stored[seq] = StoredOutcome(fingerprint: Fingerprint(mutation), outcome: outcome)
         let retention = UInt64(configuration.outcomeRetention)
         if seq > retention { stored.removeValue(forKey: seq - retention) }
         outcomes[caller] = stored
@@ -153,7 +165,9 @@ public actor CommitLog {
         let entry = LogEntry(seq: state.version + 1, event: event)
         _ = state.apply(entry) // always applies: the seq is exactly version + 1
         entries.append(entry)
-        if entries.count > configuration.maxRetainedEntries { compact() }
+        // Fold all but the newest maxRetainedEntries / 2 entries into the base, so replicas that are
+        // only slightly behind still get entries instead of a full snapshot.
+        if entries.count > configuration.maxRetainedEntries { compact(keepingLast: configuration.maxRetainedEntries / 2) }
         return entry.seq
     }
 
@@ -170,10 +184,13 @@ public actor CommitLog {
         return .entries(Array(entries[start..<end]), head: state.version)
     }
 
-    /// Folds every retained entry into the base snapshot. Open proposals live in the
-    /// snapshot, so they survive compaction.
-    public func compact() {
-        base = state
-        entries.removeAll(keepingCapacity: true)
+    /// Folds all but the newest `keepingLast` retained entries into the base snapshot.
+    /// Open proposals live in the snapshot, so they survive compaction. A replica whose
+    /// cursor is older than the new base is sent a snapshot on its next pull.
+    public func compact(keepingLast: Int = 0) {
+        let drop = entries.count - min(max(keepingLast, 0), entries.count)
+        guard drop > 0 else { return }
+        for entry in entries.prefix(drop) { _ = base.apply(entry) }
+        entries.removeFirst(drop)
     }
 }

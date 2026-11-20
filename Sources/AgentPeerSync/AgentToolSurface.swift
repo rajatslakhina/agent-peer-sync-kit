@@ -35,6 +35,10 @@ public enum ToolInputError: Error, Hashable, Sendable {
 /// everything again: this is defence in depth, not the authority.
 public struct AgentToolSurface: Sendable {
     public static let toolName = "propose_record_edit"
+    /// The largest counter delta the tool accepts: 2^53 − 1. JSON numbers arrive as
+    /// `Double`, which represents every integer exactly only up to this bound; a larger
+    /// value may already have been rounded, so it is refused rather than silently changed.
+    public static let maxCounterDelta: Int64 = 9_007_199_254_740_991
 
     public let schema: Schema
     public let policy: ActorPolicy
@@ -52,7 +56,9 @@ public struct AgentToolSurface: Sendable {
         }
     }
 
-    public func definition() -> ToolDefinition {
+    /// The tool definition, or nil when the policy offers nothing to edit (an empty
+    /// `oneOf` is not a valid JSON Schema, and a tool with no possible input is useless).
+    public func definition() -> ToolDefinition? {
         var editShapes: [JSONValue] = offeredFields.map { entry in
             let valueKey: String
             let valueSchema: JSONValue
@@ -65,7 +71,11 @@ public struct AgentToolSurface: Sendable {
                 valueSchema = .object(["type": .string("boolean")])
             case .counter:
                 valueKey = "add"
-                valueSchema = .object(["type": .string("integer")])
+                valueSchema = .object([
+                    "type": .string("integer"),
+                    "minimum": .number(-Double(Self.maxCounterDelta)),
+                    "maximum": .number(Double(Self.maxCounterDelta)),
+                ])
             }
             return .object([
                 "type": .string("object"),
@@ -86,6 +96,7 @@ public struct AgentToolSurface: Sendable {
             ]))
         }
 
+        guard !editShapes.isEmpty else { return nil }
         let lines = offeredFields.map { entry in
             "- \(entry.field.rawValue): " + (entry.grant == .direct ? "applies immediately" : "held until a person accepts it")
         }
@@ -150,7 +161,8 @@ public struct AgentToolSurface: Sendable {
                 try Self.requireOnly(["field", "add"], in: body)
                 // `Int64(exactly:)` returns nil for NaN, infinities, fractions and anything
                 // out of range, where `Int64(_:)` would trap.
-                guard case let .number(number)? = body["add"], let delta = Int64(exactly: number) else {
+                guard case let .number(number)? = body["add"], let delta = Int64(exactly: number),
+                      delta >= -Self.maxCounterDelta, delta <= Self.maxCounterDelta else {
                     throw ToolInputError.wrongValueType(field: rawField)
                 }
                 return .add(entry.field, delta)

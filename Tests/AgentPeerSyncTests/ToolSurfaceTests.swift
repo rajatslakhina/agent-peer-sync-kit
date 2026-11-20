@@ -5,8 +5,8 @@ import XCTest
 final class ToolSurfaceTests: XCTestCase {
     private let agentSurface = AgentToolSurface(schema: SampleWorkspace.schema, policy: SampleWorkspace.agentPolicy)
 
-    private func editFields(in definition: ToolDefinition) -> [String] {
-        guard case let .object(schema) = definition.inputSchema,
+    private func editFields(in definition: ToolDefinition?) -> [String] {
+        guard let definition, case let .object(schema) = definition.inputSchema,
               case let .object(properties)? = schema["properties"],
               case let .object(edits)? = properties["edits"],
               case let .object(items)? = edits["items"],
@@ -19,7 +19,7 @@ final class ToolSurfaceTests: XCTestCase {
     }
 
     func testToolOffersOnlyTheFieldsTheAgentMayWrite() {
-        let definition = agentSurface.definition()
+        guard let definition = agentSurface.definition() else { return XCTFail("the agent is offered fields") }
         XCTAssertEqual(definition.name, "propose_record_edit")
         XCTAssertEqual(editFields(in: definition), ["notes", "summary", "title"])
         XCTAssertTrue(definition.description.contains("- summary: applies immediately"))
@@ -35,12 +35,20 @@ final class ToolSurfaceTests: XCTestCase {
         XCTAssertThrowsError(try agentSurface.decode(input)) { XCTAssertEqual($0 as? ToolInputError, .deleteNotOffered) }
     }
 
-    func testDefinitionSerialisesDeterministically() {
-        let text = agentSurface.definition().json.jsonString()
-        XCTAssertEqual(text, agentSurface.definition().json.jsonString())
+    func testDefinitionSerialisesWithSortedKeysAndRoundTrips() {
+        guard let json = agentSurface.definition()?.json else { return XCTFail("definition") }
+        let text = json.jsonString()
+        XCTAssertTrue(text.hasPrefix(#"{"description":"#), "keys are sorted, so description comes first")
         XCTAssertTrue(text.contains(#""additionalProperties":false"#))
         XCTAssertTrue(text.contains(#""maxLength":120"#))
-        XCTAssertEqual(JSONValue.parse(text), agentSurface.definition().json, "round-trips")
+        XCTAssertEqual(JSONValue.parse(text), json, "round-trips")
+    }
+
+    func testAPolicyThatOffersNothingHasNoTool() {
+        let nothing = ActorPolicy(kind: .agent, directFields: [], mayCreate: false, mayDelete: false, mayReview: false)
+        XCTAssertNil(AgentToolSurface(schema: SampleWorkspace.schema, policy: nothing).definition())
+        let deleteOnly = ActorPolicy(kind: .agent, directFields: [], mayCreate: false, mayDelete: true, mayReview: false)
+        XCTAssertEqual(editFields(in: AgentToolSurface(schema: SampleWorkspace.schema, policy: deleteOnly).definition()), ["<delete>"])
     }
 
     func testDecodesAValidCall() throws {
@@ -88,6 +96,13 @@ final class ToolSurfaceTests: XCTestCase {
 
     func testCounterDeltasThatDontFitInt64AreRejectedNotTrapped() throws {
         let person = AgentToolSurface(schema: SampleWorkspace.schema, policy: SampleWorkspace.personPolicy)
+        // 9007199254740993 isn't representable as a Double; it arrives as ...992, past 2^53 - 1.
+        let rounded = JSONValue.parse(#"{"record_id":"item-1","edits":[{"field":"votes","add":9007199254740993}]}"#) ?? .null
+        XCTAssertThrowsError(try person.decode(rounded)) { XCTAssertEqual($0 as? ToolInputError, .wrongValueType(field: "votes")) }
+        let largestExact = JSONValue.object(["record_id": .string("item-1"), "edits": .array([
+            .object(["field": .string("votes"), "add": .number(-9_007_199_254_740_991)]),
+        ])])
+        XCTAssertEqual(try person.decode(largestExact).ops, [.add(Names.votes, -AgentToolSurface.maxCounterDelta)])
         for bad in [1e300, -1e300, 0.5, 9.3e18, .infinity, .nan] {
             let input = JSONValue.object(["record_id": .string("item-1"), "edits": .array([
                 .object(["field": .string("votes"), "add": .number(bad)]),

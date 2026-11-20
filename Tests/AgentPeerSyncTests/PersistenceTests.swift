@@ -72,6 +72,22 @@ final class PersistenceTests: XCTestCase {
         XCTAssertEqual(notes, .text("first"))
     }
 
+    func testAPullMovesTheNextKeyPastEditsTheLogAlreadyHolds() async throws {
+        let ws = Workspace()
+        let stale = await ws.ben.persistentState()
+        try await ws.ben.write(Names.item1, [.set(Names.notes, .text("first"))])
+        try await ws.ben.sync()
+        guard let restarted = Replica(actor: Names.ben, transport: ws.benLink, restoring: stale) else {
+            return XCTFail("restore")
+        }
+        try await restarted.sync() // nothing queued: only pulls, which reveals ben#1 in the log
+        let next = try await restarted.write(Names.item1, [.set(Names.notes, .text("second"))])
+        XCTAssertEqual(next.clientSeq, 2, "ben#1 is already taken")
+        try await restarted.sync()
+        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
+        XCTAssertEqual(notes, .text("second"))
+    }
+
     func testPendingEditsAreBounded() async throws {
         let ws = Workspace()
         await ws.ashaLink.setOnline(false)
@@ -108,6 +124,7 @@ final class PersistenceTests: XCTestCase {
         let observer = Replica(actor: Names.ben, transport: GappyTransport(server: ws.server))
         let report = try await observer.sync()
         XCTAssertEqual(report.pulledEntries, 0)
+        XCTAssertTrue(report.pullStalled, "the host is told the pull couldn't continue")
         let cursor = await observer.cursor
         XCTAssertEqual(cursor, 0, "the gapped page was not applied")
     }

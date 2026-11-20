@@ -165,8 +165,11 @@ final class ConvergenceTests: XCTestCase {
         let diverged = await ben.view().confirmed
         let truth = await ws.server.snapshot()
         XCTAssertNotEqual(diverged, truth)
-        check = await ws.convergence()
-        XCTAssertTrue(check.converged, "the workspace's own replicas are still fine")
+
+        // The check used for every schedule above reports it.
+        check = await Workspace.convergence(of: [ws.asha, ben], with: ws.server)
+        XCTAssertFalse(check.converged)
+        XCTAssertEqual(check.rows.map(\.matchesServer), [true, false])
     }
 }
 

@@ -53,6 +53,10 @@ public struct SyncReport: Hashable, Sendable {
     /// The server reported a sequence gap at the head of the outbox. The outbox is kept;
     /// this means client and server disagree about history and needs an operator.
     public var stalled = false
+    /// A pulled page didn't continue from the cursor (a gap in history). Nothing past the
+    /// gap was applied and the cursor stayed where it was; a server that keeps doing this is
+    /// broken, and the host should surface it rather than keep calling `sync()` silently.
+    public var pullStalled = false
     public init() {}
 }
 
@@ -119,6 +123,9 @@ public actor Replica {
         nextSeq = state.nextSeq
         outbox = state.outbox
         committedAhead = state.committedAhead
+        // Same rule as `bumpSequencePastAdmittedEdits()`, inlined: init is nonisolated.
+        let admitted = state.confirmed.appliedThrough[actor] ?? 0
+        if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }
     }
 
     public func persistentState() -> ReplicaState {
@@ -208,6 +215,8 @@ public actor Replica {
         case .proposed:
             outbox.remove(at: index)
             report.proposed += 1
+        case .rejected(.batchTooLarge):
+            break // not looked at by the server: stays queued for the next round
         case let .rejected(reason):
             outbox.remove(at: index)
             report.rejected += 1
@@ -236,11 +245,15 @@ public actor Replica {
                 // never skips history. The next page is requested from wherever it stopped.
                 var applied = 0
                 for entry in page where entry.seq > confirmed.version {
-                    guard confirmed.apply(entry) else { break }
+                    guard confirmed.apply(entry) else {
+                        report.pullStalled = true
+                        break
+                    }
                     applied += 1
                 }
                 report.pulledEntries += applied
                 dropPulledCommits()
+                if report.pullStalled { return }
                 // Stop at the head, or if the page made no progress.
                 if confirmed.version >= head || confirmed.version == cursor { return }
             }
@@ -249,6 +262,15 @@ public actor Replica {
 
     private func dropPulledCommits() {
         committedAhead.removeAll { $0.seq <= confirmed.version }
+        bumpSequencePastAdmittedEdits()
+    }
+
+    /// If the log already holds this actor's mutations up to some sequence number (for
+    /// instance after a relaunch from an older save), never hand out those numbers again.
+    /// A partial guard: it can't help for keys the replica uses before its first pull.
+    private func bumpSequencePastAdmittedEdits() {
+        let admitted = confirmed.appliedThrough[actor] ?? 0
+        if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }
     }
 
     // MARK: Reading

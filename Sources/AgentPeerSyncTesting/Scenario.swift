@@ -44,7 +44,16 @@ public struct ScenarioStep: Sendable {
 }
 
 public enum OfflineDayScenario {
-    public static var steps: [ScenarioStep] {
+    /// The sample agent's tool surface, built from `SampleWorkspace.agentPolicy`.
+    public static var sampleSurface: AgentToolSurface {
+        AgentToolSurface(schema: SampleWorkspace.schema, policy: SampleWorkspace.agentPolicy)
+    }
+
+    public static var steps: [ScenarioStep] { steps(agentSurface: sampleSurface) }
+
+    /// The scripted day. Step 3 submits the agent's tool calls through `agentSurface`, so a
+    /// host that builds its own surface (as the demo app does) is what decides them.
+    public static func steps(agentSurface surface: AgentToolSurface) -> [ScenarioStep] {
         [
             ScenarioStep(title: "Asha creates three action items and everyone syncs") { ws in
                 var lines: [String] = []
@@ -67,7 +76,6 @@ public enum OfflineDayScenario {
                 return lines
             },
             ScenarioStep(title: "The agent turns the meeting transcript into tool calls") { ws in
-                let surface = AgentToolSurface(schema: SampleWorkspace.schema, policy: SampleWorkspace.agentPolicy)
                 var lines: [String] = []
                 for call in ScriptedNotesAgent.calls() {
                     switch await surface.submit(call.input, to: ws.agent) {
@@ -180,6 +188,7 @@ public enum Describe {
         case .idempotencyConflict: return "idempotency key reused with a different edit"
         case .retryExpired: return "retry is older than the replay window"
         case let .baseVersionAhead(head): return "edit claims a version past the head (v\(head))"
+        case let .batchTooLarge(limit): return "more than \(limit) edits in one push"
         case .logFull: return "log sequence exhausted"
         }
     }

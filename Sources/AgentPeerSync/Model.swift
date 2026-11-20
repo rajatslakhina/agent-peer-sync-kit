@@ -177,6 +177,8 @@ public enum RejectionReason: Hashable, Sendable, Codable {
     /// The key is older than the server's retained outcome window; the outcome is gone.
     case retryExpired
     case baseVersionAhead(head: UInt64)
+    /// The push carried more mutations than the server admits in one batch.
+    case batchTooLarge(limit: Int)
     case logFull
 }
 

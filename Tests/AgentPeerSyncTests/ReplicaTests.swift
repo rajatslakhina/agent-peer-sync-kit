@@ -209,6 +209,18 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(pushes, 1, "the second caller joined the running sync")
     }
 
+    func testEditsCutFromAnOversizedBatchStayQueuedAndCommitLater() async throws {
+        let server = makeServer(.init(maxPushBatch: 2))
+        let replica = Replica(actor: Names.asha, transport: LocalTransport(server: server, authenticatedAs: Names.asha),
+                              pushBatchSize: 5)
+        for _ in 0..<5 { try await replica.write(Names.item1, [.add(Names.votes, 1)]) }
+        let report = try await replica.sync()
+        XCTAssertEqual(report.committed, 5)
+        XCTAssertEqual(report.rejected, 0)
+        let votes = await server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(5))
+    }
+
     func testASyncAfterAFinishedSyncStartsFresh() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 1)])

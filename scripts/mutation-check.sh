@@ -10,13 +10,13 @@ S=Sources/AgentPeerSync
 # file | exact text to replace (must occur exactly once; \n is a newline) | replacement | the claim it breaks
 MUTANTS=(
   '$S/CommitLog.swift|        if seq <= last {|        if false, seq <= last {|a retry replays the stored outcome instead of being re-applied'
-  '$S/CommitLog.swift|            return stored.mutation == mutation ? stored.outcome : .rejected(.idempotencyConflict)|            return stored.outcome|a reused idempotency key with a different body is refused'
+  '$S/CommitLog.swift|            return stored.fingerprint == Fingerprint(mutation) ? stored.outcome : .rejected(.idempotencyConflict)|            return stored.outcome|a reused idempotency key with a different body is refused'
   '$S/CommitLog.swift|        if seq > retention { stored.removeValue(forKey: seq - retention) }|        _ = retention|stored outcomes are bounded by the replay window'
   '$S/CommitLog.swift|        lastSeq[caller] = seq|        if case .rejected = outcome {} else { lastSeq[caller] = seq }|a rejection consumes its sequence number'
   '$S/CommitLog.swift|        guard mutation.id.actor == caller else { return .rejected(.actorMismatch) }|        _ = caller|a caller cannot submit another actor'"'"'s mutation'
   '$S/CommitLog.swift|                resolution = recheck(proposal)|                resolution = .applied|acceptance is re-checked against the current state and grant'
   '$S/CommitLog.swift|            guard proposal.author != author else { return .rejected(.selfReview) }|            _ = proposal.author|an actor cannot accept its own proposal'
-  '$S/CommitLog.swift|        if entries.count > configuration.maxRetainedEntries { compact() }|        _ = configuration.maxRetainedEntries|the log compacts itself to bound memory'
+  '$S/CommitLog.swift|        if entries.count > configuration.maxRetainedEntries { compact(keepingLast: configuration.maxRetainedEntries / 2) }|        _ = configuration.maxRetainedEntries|the log compacts itself to bound memory'
   '$S/Policy.swift|               let write = existing?.writes[name], write.version > baseVersion, write.actor != author {|               let write = existing?.writes[name], false, write.version > baseVersion, write.actor != author {|a stale write to a rejectStale field is refused'
   '$S/Policy.swift|               let write = existing?.writes[name], write.version > baseVersion, write.actor != author {|               let write = existing?.writes[name], write.version > baseVersion {|an author'"'"'s own earlier write is not a conflict'
   '$S/Policy.swift|        guard open < policy.maxOpenProposals else {|        guard true else {|open proposals per author are bounded'
@@ -30,11 +30,19 @@ MUTANTS=(
   '$S/Replica.swift|        if let running = inFlight { return try await running.value }|        _ = inFlight|concurrent sync calls share one push'
   '$S/Replica.swift|        } catch {\n            pushFailure = error\n        }|        } catch {\n            throw error\n        }|a failed push does not stop the pull'
   '$S/AgentToolSurface.swift|            guard let kind = schema.fields[field], let grant = policy.grant(for: field) else { return nil }|            guard let kind = schema.fields[field], let grant = Optional(policy.grant(for: field) ?? .direct) else { return nil }|the tool offers only the fields the actor may write'
-  '$S/AgentToolSurface.swift|                guard case let .number(number)? = body["add"], let delta = Int64(exactly: number) else {|                guard case let .number(number)? = body["add"], let delta = Optional(Int64(number)) else {|a counter delta that does not fit Int64 is refused, not trapped'
+  '$S/AgentToolSurface.swift|let delta = Int64(exactly: number),|let delta = Optional(Int64(number)),|a counter delta that does not fit Int64 is refused, not trapped'
   '$S/AgentToolSurface.swift|                try Self.requireOnly(["field", "value"], in: body)\n                guard case let .string(text)?|                guard case let .string(text)?|unexpected keys in a text edit are refused'
   '$S/State.swift|        guard version < UInt64.max, entry.seq == version + 1 else { return false }|        guard version < UInt64.max, entry.seq > version else { return false }|a replica never applies an entry past a gap'
   '$S/Replica.swift|        guard outbox.count + committedAhead.count < Self.maxPendingEdits else {|        guard true else {|pending edits are bounded'
   '$S/Replica.swift|used.allSatisfy({ $0.actor == actor && $0.clientSeq < state.nextSeq })|used.allSatisfy({ $0.actor == actor })|a restore that would reuse idempotency keys is refused'
+  '$S/CommitLog.swift|            guard index < configuration.maxPushBatch else {|            guard true else {|a push is cut at maxPushBatch'
+  '$S/CommitLog.swift|compact(keepingLast: configuration.maxRetainedEntries / 2)|compact(keepingLast: 0)|auto-compaction keeps a tail, so slightly-behind replicas get entries'
+  'Sources/AgentPeerSyncTesting/Workspace.swift|matchesServer: view.confirmed == truth|matchesServer: true|the convergence check can report divergence'
+  '$S/Replica.swift|        case .rejected(.batchTooLarge):\n            break // not looked at by the server: stays queued for the next round\n||edits cut from an oversized batch stay queued'
+  '$S/Replica.swift|                        report.pullStalled = true\n||a gap in pulled history is reported'
+  '$S/Replica.swift|        let admitted = confirmed.appliedThrough[actor] ?? 0\n        if admitted < UInt64.max, nextSeq <= admitted { nextSeq = admitted + 1 }|        _ = confirmed|a pull moves the next key past edits the log already holds'
+  '$S/AgentToolSurface.swift|                      delta >= -Self.maxCounterDelta, delta <= Self.maxCounterDelta else {|                      true else {|counter deltas beyond 2^53 - 1 are refused'
+  '$S/AgentToolSurface.swift|        guard !editShapes.isEmpty else { return nil }|        _ = editShapes.isEmpty|a policy that offers nothing has no tool'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then

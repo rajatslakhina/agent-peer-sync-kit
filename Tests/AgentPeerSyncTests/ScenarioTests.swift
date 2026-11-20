@@ -43,11 +43,13 @@ final class ScenarioTests: XCTestCase {
     func testEveryStepCanBeReplayedIntoAFreshWorkspaceStepByStep() async {
         // The demo runs steps one tap at a time; replaying a prefix must never crash or hang.
         let steps = OfflineDayScenario.steps
-        for prefix in 0...steps.count {
+        let expectedHeads: [UInt64] = [0, 3, 3, 6, 8, 9, 11, 11]
+        XCTAssertEqual(expectedHeads.count, steps.count + 1)
+        for prefix in 0...steps.count where expectedHeads.indices.contains(prefix) {
             let ws = Workspace()
             for step in steps.prefix(prefix) { _ = await step.run(ws) }
             let head = await ws.server.head
-            XCTAssertLessThanOrEqual(head, 11)
+            XCTAssertEqual(head, expectedHeads[prefix], "after \(prefix) steps")
         }
     }
 }
