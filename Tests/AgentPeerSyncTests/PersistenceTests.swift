@@ -12,6 +12,24 @@ private actor StateStore {
     }
 }
 
+/// A persist handler that can be held at a gate, to write while a save is in progress.
+private actor GatedStore {
+    private(set) var saved: [ReplicaState] = []
+    private var gated = true
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    var parked: Int { waiting.count }
+    func put(_ state: ReplicaState) async {
+        if gated { await withCheckedContinuation { waiting.append($0) } }
+        saved.append(state)
+    }
+    func open() {
+        gated = false
+        let resumed = waiting
+        waiting.removeAll()
+        for continuation in resumed { continuation.resume() }
+    }
+}
+
 /// A server stand-in that drops the second entry of every page, leaving a gap after the first.
 private struct GappyTransport: SyncTransport {
     let server: CommitLog
@@ -192,6 +210,42 @@ final class PersistenceTests: XCTestCase {
         fields["freshFrom"] = .number(2) // the field 2.0.3 and 2.0.4 wrote
         let decoded = try JSONDecoder().decode(ReplicaState.self, from: Data(JSONValue.object(fields).jsonString().utf8))
         XCTAssertEqual(decoded, saved)
+    }
+
+    func testAWriteDuringASaveIsSavedAndSentAfterItInOrder() async throws {
+        let ws = Workspace()
+        let store = GatedStore()
+        let ben = Replica(actor: Names.ben, transport: ws.benLink, persist: { await store.put($0) })
+        let a = try await ben.write(Names.item1, [.set(Names.notes, .text("A"))])
+        let running = Task { try await ben.sync() }
+        var spins = 0
+        while await store.parked == 0, spins < 10_000 {
+            await Task.yield()
+            spins += 1
+        }
+        let b = try await ben.write(Names.item1, [.set(Names.notes, .text("B"))]) // while the save waits
+        await store.open()
+        _ = try await running.value
+        let notes = await ws.server.snapshot().records[Names.item1]?[Names.notes]
+        XCTAssertEqual(notes, .text("B"), "A then B, in the order written")
+        let saves = await store.saved
+        XCTAssertEqual(saves.count, 2)
+        XCTAssertEqual(saves.first?.outbox.map(\.id), [a], "the first save held only A")
+        XCTAssertEqual(saves.last?.outbox.map(\.id), [b], "B was saved before it was sent")
+    }
+
+    func testARetryOfAlreadySavedKeysDoesNotSaveAgain() async throws {
+        let ws = Workspace()
+        let store = StateStore()
+        let ben = Replica(actor: Names.ben, transport: ws.benLink, persist: { await store.put($0) })
+        try await ben.write(Names.item1, [.add(Names.votes, 1)])
+        await ws.benLink.injectOnNextPush(.dropRequest)
+        do { try await ben.sync(); XCTFail("request dropped") } catch {}
+        try await ben.sync()
+        let calls = await store.count
+        XCTAssertEqual(calls, 1, "the retried key was already saved")
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(1))
     }
 
     func testPendingEditsAreBounded() async throws {

@@ -54,7 +54,7 @@ final class ConvergenceTests: XCTestCase {
     /// Random offline edits, reviews, connectivity changes and transport faults across two
     /// phones and an agent; then everyone reconnects. Checks the properties the README claims.
     struct Stats {
-        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0, relaunches = 0, staleRelaunches = 0
+        var committed = 0, proposed = 0, resolved = 0, rejected = 0, snapshotResets = 0, relaunches = 0, staleRelaunches = 0, keyCollisions = 0
     }
 
     @discardableResult
@@ -77,6 +77,7 @@ final class ConvergenceTests: XCTestCase {
             await saves.put(index, await replica.persistentState())
         }
         var editNumber = 0
+        var collided = Set<MutationID>()
 
         for _ in 0..<steps {
             let index = Int.random(in: 0..<replicas.count, using: &rng)
@@ -109,6 +110,12 @@ final class ConvergenceTests: XCTestCase {
                     if report.resetFromSnapshot { stats.snapshotResets += 1 }
                 }
             }
+
+            for rejection in await replicas[index].view().rejections
+            where rejection.reason == .idempotencyConflict || rejection.reason == .retryExpired {
+                collided.insert(rejection.id)
+            }
+            stats.keyCollisions = collided.count
 
             // Save, or crash and relaunch from a save (JSON round trip).
             if Int.random(in: 0..<8, using: &rng) == 0 {
@@ -199,6 +206,7 @@ final class ConvergenceTests: XCTestCase {
             total.rejected += stats.rejected
             total.relaunches += stats.relaunches
             total.staleRelaunches += stats.staleRelaunches
+            total.keyCollisions += stats.keyCollisions
         }
         // Guard against a schedule that silently stops exercising the interesting paths.
         XCTAssertGreaterThan(total.committed, 250)
@@ -207,6 +215,7 @@ final class ConvergenceTests: XCTestCase {
         XCTAssertGreaterThan(total.rejected, 25)
         XCTAssertGreaterThan(total.relaunches, 50, "replicas really were relaunched from saved state")
         XCTAssertGreaterThan(total.staleRelaunches, 5, "some relaunches used an older save")
+        XCTAssertGreaterThan(total.keyCollisions, 0, "a stale relaunch really reused a key the server held")
     }
 
     func testRandomSchedulesConvergeThroughCompactionAndASmallReplayWindow() async throws {

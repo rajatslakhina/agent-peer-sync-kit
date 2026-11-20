@@ -23,15 +23,19 @@ public enum ReplicaError: Error, Hashable, Sendable {
 /// its whole life; the server applies a key at most once. So no edit is ever applied twice,
 /// whatever crashes or retries happen. To make sure no key reaches the network unsaved,
 /// give the replica a `persist` handler: it is called with this state, and must have stored
-/// it durably, before every push (a push doesn't happen if it throws).
+/// it durably, before any push that carries a key it hasn't been given yet (a push doesn't
+/// happen if it throws).
 ///
-/// **What a stale save can still cost.** Restoring a state older than the last one persisted
-/// (a lost write, a restore from backup) can hand out keys the server already holds. Edits
-/// under such a key are never applied twice, but they can be lost: a different body is
-/// refused as `.idempotencyConflict` (listed in `rejections`); an identical body is taken to
-/// be the old edit and reported as committed with the old outcome, without being applied
-/// again. After its first pull a restored replica moves its next key past every key the log
-/// shows, which narrows this to keys whose only outcome was a refusal.
+/// **What a stale save can still cost.** Restoring a state older than the last one stored
+/// (a lost write, a restore from backup) can hand out keys the server already holds.
+/// Nothing is applied twice, but an edit under such a key is lost: if its body differs it
+/// is refused as `.idempotencyConflict`; if its body is identical it gets that key's stored
+/// outcome back (committed, proposed or refused) and is not applied again; and if the key
+/// is older than the server's replay window it is refused as `.retryExpired` either way, so
+/// an edit from the restored outbox that was in fact applied earlier is also listed as
+/// `.retryExpired`. Refusals appear in `rejections`. After its first pull a restored
+/// replica moves its next key past every key the log shows, which narrows new collisions
+/// to keys whose only outcome was a refusal.
 public struct ReplicaState: Hashable, Sendable, Codable {
     public let actor: ActorID
     public let confirmed: Snapshot
@@ -59,8 +63,11 @@ public struct SyncReport: Hashable, Sendable {
     public var rejected = 0
     public var pulledEntries = 0
     public var resetFromSnapshot = false
-    /// The server reported a sequence gap at the head of the outbox. The outbox is kept;
-    /// this means client and server disagree about history and needs an operator.
+    /// The outbox couldn't drain and is kept: either the server reported a sequence gap at
+    /// its head (client and server disagree about history; that needs an operator), or it
+    /// refused the caller itself (unknown or revoked actor, or a credential that doesn't
+    /// match the edit's author). Refusals about the caller consume no sequence number, so
+    /// those edits stay queued and go out once access returns.
     public var stalled = false
     /// The pull stopped short of the server's head: a page didn't continue from the cursor
     /// (a gap in history; nothing past it was applied), a page made no progress while the
@@ -91,7 +98,12 @@ public struct ReplicaView: Hashable, Sendable {
 /// `sync()` pushes the outbox, then pulls the log from the replica's cursor and rebuilds
 /// `visible` on top of the new confirmed state.
 public actor Replica {
-    /// Stores a `ReplicaState` durably. Called before every push; throwing cancels the push.
+    /// Stores a `ReplicaState` durably. Called before a push whenever that push carries a key
+    /// newer than the last state it was given (so a retry of already-saved keys doesn't save
+    /// again); throwing cancels the push. It runs while the sync is in progress, so it must
+    /// not call `sync()` on the same replica (that call would wait for the running sync,
+    /// which is waiting for the handler). Each call encodes the whole state, confirmed
+    /// snapshot included, so its cost grows with the data.
     public typealias PersistHandler = @Sendable (ReplicaState) async throws -> Void
 
     public static let maxRetainedRejections = 50
@@ -111,6 +123,9 @@ public actor Replica {
     private var committedAhead: [CommittedEdit] = []
     private var rejections: [RejectedEdit] = []
     private var inFlight: Task<SyncReport, any Error>?
+    /// Every key below this was in a state the persist handler (or the host, for a restored
+    /// replica) already stored.
+    private var persistedBelow: UInt64 = 1
     /// How many `sync()` calls joined a sync that was already running. Observed by tests.
     private(set) var joinedSyncs = 0
     /// Pages one sync may pull before reporting `pullStalled`. Internal so tests can lower it.
@@ -118,7 +133,7 @@ public actor Replica {
     func setPullPageBudget(_ pages: Int) { pullPageBudget = max(1, pages) }
 
     /// Batch and page sizes are clamped to `1...500`. `persist`, if given, is called with
-    /// `persistentState()` before every push (see `ReplicaState`).
+    /// `persistentState()` before any push that carries an unsaved key (see `ReplicaState`).
     public init(actor: ActorID, transport: any SyncTransport, pushBatchSize: Int = 50, pullPageSize: Int = 200,
                 persist: PersistHandler? = nil) {
         self.actor = actor
@@ -152,6 +167,7 @@ public actor Replica {
         let admitted = state.confirmed.appliedThrough[actor] ?? 0
         if admitted < UInt64.max, next <= admitted { next = admitted + 1 }
         nextSeq = next
+        persistedBelow = state.nextSeq // the restored state itself was stored
     }
 
     public func persistentState() -> ReplicaState {
@@ -234,7 +250,11 @@ public actor Replica {
         while !outbox.isEmpty {
             let batch = Array(outbox.prefix(pushBatchSize))
             // Write-ahead: the state holding these keys is stored before they leave the device.
-            if let persist { try await persist(persistentState()) }
+            if let persist, let top = batch.last?.id.clientSeq, top >= persistedBelow {
+                let state = persistentState() // captured before the await: writes may land meanwhile
+                try await persist(state)
+                persistedBelow = max(persistedBelow, state.nextSeq)
+            }
             let results = try await transport.push(batch)
             // Edits made while the push was in flight were appended behind the batch, and
             // results are matched by idempotency key, so they can't be mistaken for answered ones.
@@ -245,7 +265,7 @@ public actor Replica {
     }
 
     private func settle(_ result: PushResult, report: inout SyncReport) {
-        guard let index = outbox.firstIndex(where: { $0.id == result.id }), outbox.indices.contains(index) else {
+        guard let index = outbox.firstIndex(where: { $0.id == result.id }) else {
             return // an answer for something already settled (e.g. a duplicated response)
         }
         let mutation = outbox[index]
@@ -259,6 +279,10 @@ public actor Replica {
             report.proposed += 1
         case .rejected(.batchTooLarge):
             break // not looked at by the server: stays queued for the next round
+        case .rejected(.unknownActor), .rejected(.actorMismatch):
+            // A refusal of the caller, not of the edit: no sequence number was consumed, so
+            // dropping it would leave a gap. Keep it queued until access returns.
+            report.stalled = true
         case let .rejected(reason):
             outbox.remove(at: index)
             report.rejected += 1

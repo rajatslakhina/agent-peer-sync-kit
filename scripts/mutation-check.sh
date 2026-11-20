@@ -50,7 +50,10 @@ MUTANTS=(
   '$S/Replica.swift|        report.pullStalled = true // page budget exhausted before reaching the head\n||running out of page budget is reported'
   '$S/AgentToolSurface.swift|        if policy.mayDelete { lines.append(|        if false, policy.mayDelete { lines.append(|the tool description mentions delete when it is offered'
   '$S/CommitLog.swift|        public var outcomeRetention: Int { didSet { outcomeRetention = min(max(outcomeRetention, 1), 100_000) } }|        public var outcomeRetention: Int|configuration set after init is clamped'
-  '$S/Replica.swift|            if let persist { try await persist(persistentState()) }|            _ = persist|the persist handler stores the state before every push'
+  '$S/Replica.swift|                try await persist(state)|                _ = state|the persist handler stores the state before a push with new keys'
+  '$S/Replica.swift|        case .rejected(.unknownActor), .rejected(.actorMismatch):\n            // A refusal of the caller, not of the edit: no sequence number was consumed, so\n            // dropping it would leave a gap. Keep it queued until access returns.\n            report.stalled = true\n||edits refused for a revoked actor stay queued'
+  '$S/Replica.swift|top >= persistedBelow {|top >= 0 {|a retry of already-saved keys does not save again'
+  '$S/Replica.swift|                persistedBelow = max(persistedBelow, state.nextSeq)|                persistedBelow = max(persistedBelow, nextSeq)|a write during a save is saved before it is sent'
 )
 if command -v timeout >/dev/null; then LIMIT="timeout 300"; else LIMIT="perl -e alarm(300);exec(@ARGV)"; fi
 if ! swift build --build-tests -q >/dev/null 2>&1 || ! $LIMIT swift test --skip-build >/dev/null 2>&1; then

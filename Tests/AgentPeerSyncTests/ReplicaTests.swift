@@ -316,6 +316,26 @@ final class ReplicaTests: XCTestCase {
         XCTAssertEqual(view.outbox.count, 1, "still queued until a push learns the outcome")
     }
 
+    func testEditsRefusedBecauseTheActorIsRevokedStayQueuedUntilItIsGrantedBack() async throws {
+        let ws = Workspace()
+        try await ws.ben.sync()
+        await ws.server.setPolicy(nil, for: Names.ben)
+        try await ws.ben.write(Names.item1, [.add(Names.votes, 1)])
+        let revoked = try await ws.ben.sync()
+        XCTAssertTrue(revoked.stalled)
+        let queued = await ws.ben.view()
+        XCTAssertEqual(queued.outbox.count, 1, "kept: the refusal consumed no sequence number")
+        XCTAssertTrue(queued.rejections.isEmpty)
+
+        await ws.server.setPolicy(SampleWorkspace.personPolicy, for: Names.ben)
+        try await ws.ben.write(Names.item1, [.add(Names.votes, 1)])
+        let granted = try await ws.ben.sync()
+        XCTAssertEqual(granted.committed, 2)
+        XCTAssertFalse(granted.stalled)
+        let votes = await ws.server.snapshot().records[Names.item1]?[Names.votes]
+        XCTAssertEqual(votes, .count(2))
+    }
+
     func testASyncAfterAFinishedSyncStartsFresh() async throws {
         let ws = Workspace()
         try await ws.asha.write(Names.item1, [.add(Names.votes, 1)])
